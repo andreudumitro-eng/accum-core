@@ -68,6 +68,10 @@ impl Storage {
         
         Ok(Self { db })
     }
+        /// Alias for open() for convenience
+        pub fn new(path: &str) -> Result<Self, Error> {
+            Self::open(path)
+        }
     
     /// Get column family handle
     fn cf(&self, column: Column) -> &ColumnFamily {  // <-- ИЗМЕНЕНО

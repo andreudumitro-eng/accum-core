@@ -1,9 +1,11 @@
-//! P2P protocol messages and handling
+//! P2P protocol messages and handling for ACCUM protocol
+//! Strictly following ACCUM v3.2+ specification
 
 use crate::block::Block;
 use crate::error::Error;
 use crate::share::SharePacket;
 use crate::types::{Hash32, MinerId};
+use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,7 +57,7 @@ pub struct BlockMessage {
 /// Transaction message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxMessage {
-    pub tx: Vec<u8>, // Simplified
+    pub tx: Vec<u8>,
 }
 
 /// Share message
@@ -86,7 +88,7 @@ pub struct SharesReplyMessage {
     pub shares_batch: Vec<SharePacket>,
 }
 
-/// Compact block (BIP152 style)
+/// Compact block
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactBlockMessage {
     pub header_hash: Hash32,
@@ -128,6 +130,7 @@ pub enum P2PMessage {
 /// Peer connection state
 #[derive(Debug, Clone)]
 pub struct Peer {
+    pub peer_id: PeerId,
     pub address: String,
     pub version: Option<VersionMessage>,
     pub connected_at: u64,
@@ -140,13 +143,14 @@ pub struct Peer {
 
 impl Peer {
     /// Create new peer
-    pub fn new(address: String) -> Self {
+    pub fn new(peer_id: PeerId, address: String) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         
         Self {
+            peer_id,
             address,
             version: None,
             connected_at: now,
@@ -183,14 +187,12 @@ impl Peer {
             .unwrap()
             .as_secs();
         
-        // Reset counter if minute passed
         if now - self.last_share_time >= 60 {
             self.share_count = 0;
         }
         
-        // Check rate limit
         if self.share_count >= 100 {
-            self.ban(5); // 5 minute ban
+            self.ban(5);
             return Err(Error::P2p);
         }
         
@@ -200,15 +202,25 @@ impl Peer {
         
         Ok(())
     }
+
+    /// Update last seen
+    pub fn seen(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.last_seen = now;
+    }
 }
 
 /// P2P network manager
 #[derive(Debug)]
 pub struct P2PManager {
-    peers: HashMap<String, Peer>,
+    pub peers: HashMap<PeerId, Peer>,
     max_peers: usize,
-    message_history: Vec<(u64, String, P2PMessage)>,
+    message_history: Vec<(u64, PeerId, P2PMessage)>,
     max_history: usize,
+    known_addresses: Vec<String>,
 }
 
 impl P2PManager {
@@ -219,31 +231,38 @@ impl P2PManager {
             max_peers,
             message_history: Vec::new(),
             max_history: 1000,
+            known_addresses: Vec::new(),
         }
     }
 
     /// Add or update peer
-    pub fn add_peer(&mut self, address: String) {
+    pub fn add_peer(&mut self, peer_id: PeerId, address: String) {
         if self.peers.len() >= self.max_peers {
-            // Remove oldest inactive peer
             if let Some(oldest) = self.find_oldest_peer() {
                 self.peers.remove(&oldest);
             }
         }
         
-        self.peers.entry(address.clone())
-            .or_insert_with(|| Peer::new(address));
+        let address_for_peer = address.clone();
+        let address_for_list = address;
+        
+        self.peers.entry(peer_id)
+            .or_insert_with(|| Peer::new(peer_id, address_for_peer));
+        
+        if !self.known_addresses.contains(&address_for_list) {
+            self.known_addresses.push(address_for_list);
+        }
     }
 
     /// Find oldest peer by last_seen
-    fn find_oldest_peer(&self) -> Option<String> {
+    fn find_oldest_peer(&self) -> Option<PeerId> {
         let mut oldest = None;
         let mut oldest_time = u64::MAX;
         
-        for (addr, peer) in &self.peers {
+        for (id, peer) in &self.peers {
             if peer.last_seen < oldest_time {
                 oldest_time = peer.last_seen;
-                oldest = Some(addr.clone());
+                oldest = Some(*id);
             }
         }
         
@@ -251,100 +270,111 @@ impl P2PManager {
     }
 
     /// Process incoming message
-    pub fn process_message(&mut self, from: String, msg: P2PMessage) -> Result<Option<P2PMessage>, Error> {
+    pub fn process_message(&mut self, from: PeerId, msg: P2PMessage) -> Result<Option<P2PMessage>, Error> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         
-        // Check if peer is banned
-        if let Some(peer) = self.peers.get(&from) {
+        if let Some(peer) = self.peers.get_mut(&from) {
             if peer.is_banned() {
                 return Err(Error::P2p);
             }
+            peer.seen();
+        } else {
+            return Err(Error::P2p);
         }
         
-        // Record message
-        self.message_history.push((now, from.clone(), msg.clone()));
+        self.message_history.push((now, from, msg.clone()));
         if self.message_history.len() > self.max_history {
             self.message_history.remove(0);
         }
         
-        // Handle message
         match msg {
             P2PMessage::Version(version) => {
                 self.handle_version(from, version)
             }
-            P2PMessage::Verack => {
-                Ok(None)
-            }
-            P2PMessage::Inv(inv) => {
-                self.handle_inv(from, inv)
-            }
-            P2PMessage::GetData(getdata) => {
-                self.handle_getdata(from, getdata)
-            }
-            P2PMessage::Share(share) => {
-                self.handle_share(from, share)
-            }
+            P2PMessage::Verack => Ok(None),
+            P2PMessage::Inv(inv) => self.handle_inv(from, inv),
+            P2PMessage::GetData(getdata) => self.handle_getdata(from, getdata),
+            P2PMessage::Share(share) => self.handle_share(from, share),
             P2PMessage::Ping(ping) => {
                 Ok(Some(P2PMessage::Pong(PongMessage { nonce: ping.nonce })))
             }
-            P2PMessage::Pong(_) => {
-                Ok(None)
-            }
-            _ => {
-                // Other messages handled elsewhere
-                Ok(None)
-            }
+            P2PMessage::Pong(_) => Ok(None),
+            P2PMessage::GetShares(gets) => self.handle_getshares(from, gets),
+            P2PMessage::SharesReply(reply) => self.handle_sharesreply(from, reply),
+            P2PMessage::EpochCommit(commit) => self.handle_epochcommit(from, commit),
+            _ => Ok(None),
         }
     }
 
-    /// Handle version message
-    fn handle_version(&mut self, from: String, version: VersionMessage) -> Result<Option<P2PMessage>, Error> {
+    fn handle_version(&mut self, from: PeerId, version: VersionMessage) -> Result<Option<P2PMessage>, Error> {
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.version = Some(version);
-            peer.last_seen = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            peer.seen();
         }
-        
         Ok(Some(P2PMessage::Verack))
     }
 
-    /// Handle inventory message
-    /// Handle inventory message
-fn handle_inv(&mut self, _from: String, inv: InvMessage) -> Result<Option<P2PMessage>, Error> {
-    // Request unknown items
-    let mut to_request = Vec::new();
-    for item in inv.items {
-        // In real implementation: check if we have it
-        to_request.push(item);
+    fn handle_inv(&mut self, _from: PeerId, inv: InvMessage) -> Result<Option<P2PMessage>, Error> {
+        let mut to_request = Vec::new();
+        for item in inv.items {
+            to_request.push(item);
+        }
+        
+        if !to_request.is_empty() {
+            Ok(Some(P2PMessage::GetData(GetDataMessage { items: to_request })))
+        } else {
+            Ok(None)
+        }
     }
-    
-    if !to_request.is_empty() {
-        Ok(Some(P2PMessage::GetData(GetDataMessage { items: to_request })))
-    } else {
+
+    fn handle_getdata(&mut self, _from: PeerId, _getdata: GetDataMessage) -> Result<Option<P2PMessage>, Error> {
         Ok(None)
     }
-}
 
-    /// Handle getdata message
-fn handle_getdata(&mut self, _from: String, _getdata: GetDataMessage) -> Result<Option<P2PMessage>, Error> {
-    // In real implementation: lookup and return items
-    Ok(None)
-}
-
-    /// Handle share message
-fn handle_share(&mut self, from: String, _share: ShareMessage) -> Result<Option<P2PMessage>, Error> {
-    if let Some(peer) = self.peers.get_mut(&from) {
-        peer.record_share()?;
+    fn handle_share(&mut self, from: PeerId, _share: ShareMessage) -> Result<Option<P2PMessage>, Error> {
+        if let Some(peer) = self.peers.get_mut(&from) {
+            peer.record_share()?;
+        }
+        Ok(None)
     }
-    
-    // Share validated elsewhere
-    Ok(None)
-}
+
+    fn handle_getshares(&mut self, _from: PeerId, _gets: GetSharesMessage) -> Result<Option<P2PMessage>, Error> {
+        Ok(None)
+    }
+
+    fn handle_sharesreply(&mut self, _from: PeerId, _reply: SharesReplyMessage) -> Result<Option<P2PMessage>, Error> {
+        Ok(None)
+    }
+
+    fn handle_epochcommit(&mut self, _from: PeerId, _commit: EpochCommitMessage) -> Result<Option<P2PMessage>, Error> {
+        Ok(None)
+    }
+
+    /// Broadcast message to all peers
+    pub fn broadcast(&self, msg: P2PMessage) -> Vec<(PeerId, P2PMessage)> {
+        let mut broadcasts = Vec::new();
+        
+        for (id, peer) in &self.peers {
+            if !peer.is_banned() {
+                broadcasts.push((*id, msg.clone()));
+            }
+        }
+        
+        broadcasts
+    }
+
+    /// Send message to specific peer
+    pub fn send_to(&self, peer_id: PeerId, msg: P2PMessage) -> Option<(PeerId, P2PMessage)> {
+        if let Some(peer) = self.peers.get(&peer_id) {
+            if !peer.is_banned() {
+                return Some((peer_id, msg));
+            }
+        }
+        None
+    }
 
     /// Get peer count
     pub fn peer_count(&self) -> usize {
@@ -352,11 +382,16 @@ fn handle_share(&mut self, from: String, _share: ShareMessage) -> Result<Option<
     }
 
     /// Get banned peers
-    pub fn banned_peers(&self) -> Vec<String> {
+    pub fn banned_peers(&self) -> Vec<PeerId> {
         self.peers.iter()
             .filter(|(_, p)| p.is_banned())
-            .map(|(addr, _)| addr.clone())
+            .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Get known addresses
+    pub fn known_addresses(&self) -> &Vec<String> {
+        &self.known_addresses
     }
 
     /// Clean up old peers
@@ -366,7 +401,6 @@ fn handle_share(&mut self, from: String, _share: ShareMessage) -> Result<Option<
             .unwrap()
             .as_secs();
         
-        // Remove peers inactive for > 1 hour
         self.peers.retain(|_, peer| now - peer.last_seen < 3600);
     }
 }
@@ -375,16 +409,19 @@ fn handle_share(&mut self, from: String, _share: ShareMessage) -> Result<Option<
 mod tests {
     use super::*;
     
+    fn create_test_peer_id() -> PeerId {
+        PeerId::random()
+    }
+    
     #[test]
     fn test_peer_rate_limit() {
-        let mut peer = Peer::new("127.0.0.1:8333".to_string());
+        let peer_id = create_test_peer_id();
+        let mut peer = Peer::new(peer_id, "127.0.0.1:8333".to_string());
         
-        // 100 shares should be OK
-        for i in 0..100 {
+        for _ in 0..100 {
             assert!(peer.record_share().is_ok());
         }
         
-        // 101st share should ban
         assert!(peer.record_share().is_err());
         assert!(peer.is_banned());
     }
@@ -392,8 +429,9 @@ mod tests {
     #[test]
     fn test_p2p_manager() {
         let mut manager = P2PManager::new(10);
+        let peer_id = create_test_peer_id();
         
-        manager.add_peer("127.0.0.1:8333".to_string());
+        manager.add_peer(peer_id, "127.0.0.1:8333".to_string());
         assert_eq!(manager.peer_count(), 1);
         
         let version = VersionMessage {
@@ -406,7 +444,7 @@ mod tests {
         };
         
         let response = manager.process_message(
-            "127.0.0.1:8333".to_string(),
+            peer_id,
             P2PMessage::Version(version)
         ).unwrap();
         

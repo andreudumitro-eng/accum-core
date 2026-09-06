@@ -1,35 +1,108 @@
+//! Error types for ACCUM protocol
+
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[error("invalid block")]
-    InvalidBlock,
-    #[error("invalid timestamp")]
+    // Block errors
+    #[error("Invalid header length: expected 120 bytes")]
+    InvalidHeaderLength,
+    
+    #[error("Invalid block hash - PoW not met")]
+    InvalidPoW,
+    
+    #[error("Invalid timestamp")]
     InvalidTimestamp,
-    #[error("invalid previous hash")]
+    
+    #[error("Invalid previous hash")]
     InvalidPrevHash,
-    #[error("invalid merkle root")]
+    
+    #[error("Invalid merkle root")]
     InvalidMerkleRoot,
-    #[error("invalid proof of work")]
-    InvalidProofOfWork,
-    #[error("invalid coinbase")]
+    
+    #[error("Invalid coinbase transaction")]
     InvalidCoinbase,
-    #[error("invalid share")]
-    InvalidShare,
-    #[error("insufficient input")]
-    InsufficientInput,
-    #[error("fee too low")]
-    FeeTooLow,
-    #[error("dust output")]
-    DustOutput,
-    #[error("double spend")]
-    DoubleSpend,
-    #[error("invalid script")]
-    InvalidScript,
-    #[error("invalid epoch")]
+    
+    #[error("Invalid epoch")]
     InvalidEpoch,
-    #[error("p2p error")]
+    
+    // Share errors
+    #[error("Invalid share")]
+    InvalidShare,
+    
+    #[error("Invalid share length: expected 180 bytes")]
+    InvalidShareLength,
+    
+    #[error("Invalid miner ID")]
+    InvalidMinerId,
+    
+    #[error("Stale share - prev_hash mismatch")]
+    StaleShare,
+    
+    #[error("Too many shares per miner")]
+    TooManyShares,
+    
+    #[error("Prefilter rejected")]
+    PrefilterRejected,
+    
+    #[error("Share target not met")]
+    ShareTargetNotMet,
+    
+    #[error("Share error: {0}")]
+    ShareError(String),
+    
+    // Miner errors
+    #[error("Insufficient bond - minimum {0} LYT required")]
+    InsufficientBond(u64),
+    
+    #[error("Bond not found")]
+    BondNotFound,
+    
+    #[error("Bond still locked")]
+    BondLocked,
+    
+    // Transaction errors
+    #[error("Insufficient input")]
+    InsufficientInput,
+    
+    #[error("Double spend")]
+    DoubleSpend,
+    
+    #[error("Invalid signature")]
+    InvalidSignature,
+    
+    // Network errors
+    #[error("P2P error")]
     P2p,
-    #[error("storage error")]
+    
+    #[error("Peer banned")]
+    PeerBanned,
+    
+    #[error("Rate limit exceeded")]
+    RateLimitExceeded,
+    
+    // Storage errors
+    #[error("Storage error")]
     Storage,
+    
+    #[error("Database error: {0}")]
+    Database(String),
+    
+    #[error("Key not found")]
+    KeyNotFound,
+    
+    // Serialization errors
+    #[error("Serialization error")]
+    Serialization,
+    
+    #[error("Deserialization failed")]
+    DeserializationFailed,
+    
+    // IO errors
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    // Other
+    #[error("Other error: {0}")]
+    Other(String),
 }

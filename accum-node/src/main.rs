@@ -1076,7 +1076,81 @@ impl Wallet {
     fn public_key_bytes(&self) -> &[u8] {
         &self.public_key
     }
-}
+
+    fn create_simple_tx(
+        &self,
+        utxos: &[(OutPoint, TxOut)],
+        to_address: &str,
+        amount: u64,
+        fee: u64,
+    ) -> Result<Transaction, String> {
+        if amount == 0 {
+            return Err("Amount must be greater than 0".to_string());
+        }
+    
+        let mut selected = Vec::new();
+        let mut total_in = 0u64;
+    
+        for (outpoint, output) in utxos {
+            selected.push((outpoint.clone(), output.clone()));
+            total_in += output.value;
+            if total_in >= amount + fee {
+                break;
+            }
+        }
+    
+        if total_in < amount + fee {
+            return Err(format!(
+                "Insufficient funds. Need {} LYT, have {} LYT",
+                amount + fee,
+                total_in
+            ));
+        }
+    
+        let change = total_in - amount - fee;
+    
+        // Входы
+        let mut inputs = Vec::new();
+        for (outpoint, _) in &selected {
+            inputs.push(TxIn {
+                prev_txid: outpoint.0,
+                prev_index: outpoint.1,
+                script_sig: vec![],
+                sequence: 0xFFFFFFFF,
+            });
+        }
+    
+        // Выходы
+        let mut outputs = Vec::new();
+    
+        // Получатель
+        let mut recipient = TxOut::create_p2pkh(to_address)?;
+        recipient.value = amount;
+        outputs.push(recipient);
+    
+        // Сдача (если есть)
+        if change > DUST_LIMIT_LYT {
+            let mut change_out = TxOut::create_p2pkh(&self.address)?;
+            change_out.value = change;
+            outputs.push(change_out);
+        }
+    
+        let mut tx = Transaction {
+            version: 1,
+            inputs,
+            outputs,
+            locktime: 0,
+        };
+    
+        // Подписываем все входы (используем клон для вычисления sighash)
+        for i in 0..tx.inputs.len() {
+            let tx_clone = tx.clone();
+            tx.inputs[i].sign(self, &tx_clone, i)?;
+        }
+    
+        Ok(tx)
+    }
+}      
 
 // ============================================================
 // БЛОК HEADER
@@ -1746,7 +1820,64 @@ impl ProductionStorage {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    fn get_node_info(&self) -> Result<(Height, u32, u64), String> {
+        let height = self.get_height()?;
+        let epoch = self.get_state::<u32>("epoch")?.unwrap_or(1);
+        
+        // Считаем примерное количество UTXO
+        let mut utxo_count = 0u64;
+        let iter = self.db.iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
+        for item in iter {
+            if item.is_ok() {
+                utxo_count += 1;
+            }
+        }
+        
+        Ok((height, epoch, utxo_count))
+    }
     
+    fn get_balance_by_address(&self, address: &str) -> Result<(u64, u64), String> {
+        let mut total = 0u64;
+        let mut utxo_count = 0u64;
+    
+        let iter = self.db.iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
+    
+        for item in iter {
+            let (_key, value) = item.map_err(|e| e.to_string())?;
+            let output: TxOut = bincode::deserialize(&value).map_err(|e| e.to_string())?;
+    
+            if let Some(addr) = output.extract_address() {
+                if addr == address {
+                    total = total.saturating_add(output.value);
+                    utxo_count += 1;
+                }
+            }
+        }
+    
+        Ok((total, utxo_count))
+    }
+    
+    fn get_utxos_by_address(&self, address: &str) -> Result<Vec<(OutPoint, TxOut)>, String> {
+        let mut result = Vec::new();
+    
+        let iter = self.db.iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
+    
+        for item in iter {
+            let (key, value) = item.map_err(|e| e.to_string())?;
+            let outpoint: OutPoint = bincode::deserialize(&key).map_err(|e| e.to_string())?;
+            let output: TxOut = bincode::deserialize(&value).map_err(|e| e.to_string())?;
+    
+            if let Some(addr) = output.extract_address() {
+                if addr == address {
+                    result.push((outpoint, output));
+                }
+            }
+        }
+    
+        Ok(result)
+    }
+
     fn delete_utxo(&self, outpoint: &OutPoint) -> Result<(), String> {
         let key = bincode::serialize(outpoint).map_err(|e| e.to_string())?;
         self.db.delete_cf(self.cf_handle(CF_UTXO), key)
@@ -2190,6 +2321,7 @@ impl LoyaltyData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MinerData {
     miner_id: MinerId,
+    pubkey: Vec<u8>,
     shares: u64,
     bond: u64,
     loyalty: f64,
@@ -2207,6 +2339,7 @@ impl MinerData {
     fn new(miner_id: MinerId, bond: u64, epoch: u32, time: Timestamp) -> Self {
         Self {
             miner_id,
+            pubkey: Vec::new(),
             shares: 0,
             bond,
             loyalty: 0.0,
@@ -2220,36 +2353,36 @@ impl MinerData {
             first_seen: time,
         }
     }
-    
+
     fn is_banned(&self, now: Timestamp) -> bool {
         self.banned_until.map_or(false, |until| now < until)
     }
-    
+
     fn update_invalid_ratio(&mut self, ratio: f64, now: Timestamp) {
         self.invalid_ratio = ratio;
-        
+
         if ratio > INVALID_SHARE_BAN_THRESHOLD {
             self.banned_until = Some(now + PEER_BAN_DURATION_SECS * 3);
         } else if ratio > INVALID_SHARE_WARNING_THRESHOLD {
             self.banned_until = Some(now + PEER_BAN_DURATION_SECS);
         }
     }
-    
+
     fn can_add_share(&self) -> bool {
         self.shares < MAX_SHARES_PER_MINER_PER_EPOCH
     }
-    
+
     fn add_share(&mut self, timestamp: Timestamp) {
         self.shares += 1;
         self.total_shares_historical += 1;
         self.last_share_time = timestamp;
     }
-    
+
     fn add_block(&mut self, reward: u64) {
         self.blocks_found += 1;
         self.total_rewards += reward;
     }
-    
+
     fn get_hash_rate_estimate(&self, now: Timestamp) -> f64 {
         let time_diff = now - self.first_seen;
         if time_diff == 0 {
@@ -2282,6 +2415,7 @@ struct AggregatedShare {
     share_count: u32,
     merkle_root: Hash32,
     signature: Vec<u8>,
+    pubkey: Vec<u8>,         
     timestamp: Timestamp,
     epoch: u32,
 }
@@ -2312,6 +2446,7 @@ impl AggregatedShare {
             share_count,
             merkle_root,
             signature,
+            pubkey: wallet.public_key_bytes().to_vec(),   // ← ДОБАВИЛИ
             timestamp,
             epoch,
         })
@@ -2358,36 +2493,60 @@ impl AggregatedShare {
         hash.into()
     }
     
-    pub fn verify(&self, shares: &[Share], _storage: &ProductionStorage) -> Result<bool, String> {
+    pub fn verify(&self, shares: &[Share]) -> Result<bool, String> {
+        // 1. Количество shares
         if shares.len() as u32 != self.share_count {
             return Ok(false);
         }
-        
+    
+        // 2. Все shares от одного майнера
         for share in shares {
             if share.miner_id != self.miner_id {
                 return Ok(false);
             }
         }
-        
+    
+        // 3. Merkle root
         let computed_root = Self::build_merkle_root(shares);
         if computed_root != self.merkle_root {
             return Ok(false);
         }
-        
-        let _message = Self::build_message(
+    
+        // 4. Проверяем, что pubkey соответствует miner_id
+        let pubkey = match PublicKey::from_slice(&self.pubkey) {
+            Ok(pk) => pk,
+            Err(_) => return Ok(false),
+        };
+    
+        let expected_miner_id = Wallet::miner_id_from_pubkey(&pubkey);
+        if expected_miner_id != self.miner_id {
+            return Ok(false);
+        }
+    
+        // 5. Проверяем подпись
+        let message = Self::build_message(
             &self.miner_id,
             self.share_count,
             &self.merkle_root,
             self.epoch,
             self.timestamp,
         );
-        
-        // TODO: Получить pubkey из storage
+    
+        if !Wallet::verify_signature(&self.pubkey, &self.signature, &message) {
+            return Ok(false);
+        }
+    
         Ok(true)
     }
     
     pub fn size_bytes(&self) -> usize {
-        std::mem::size_of::<MinerId>() + 4 + 32 + self.signature.len() + 8 + 4
+        std::mem::size_of::<MinerId>() 
+            + 4 
+            + 32 
+            + self.signature.len() 
+            + self.pubkey.len()      // ← добавили
+            + 8 
+            + 4
     }
 }
 
@@ -2417,8 +2576,8 @@ impl AggregatedSharePool {
             return Ok(false);
         }
         
-        let storage = ProductionStorage::new("temp")?;
-        if !agg.verify(shares, &storage)? {
+        // Теперь storage не нужен
+        if !agg.verify(shares)? {
             return Ok(false);
         }
         
@@ -2426,10 +2585,11 @@ impl AggregatedSharePool {
         self.share_counts.insert(agg.miner_id, agg.share_count);
         self.verified_roots.insert(agg.merkle_root);
         
+        // Ограничение по количеству
         if self.aggregates.len() > self.max_aggregates {
             if let Some(oldest) = self.aggregates.keys().next().copied() {
-                if let Some(agg) = self.aggregates.remove(&oldest) {
-                    self.verified_roots.remove(&agg.merkle_root);
+                if let Some(removed) = self.aggregates.remove(&oldest) {
+                    self.verified_roots.remove(&removed.merkle_root);
                     self.share_counts.remove(&oldest);
                 }
             }
@@ -5511,14 +5671,120 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         }
         Some("balance") => {
             let address = args.get(3).ok_or("Address required")?;
+            
             println!("📊 Checking balance for {}...", address);
-            println!("   (connect to running node for balance)");
+            
+            // Пробуем открыть локальную базу mainnet
+            let storage = match ProductionStorage::new("mainnet") {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("❌ Cannot open database: {}", e);
+                    println!("   Make sure the node has been run at least once.");
+                    return Ok(());
+                }
+            };
+        
+            match storage.get_balance_by_address(address) {
+                Ok((balance_lyt, utxo_count)) => {
+                    let acm = balance_lyt as f64 / LYATORS_PER_ACM as f64;
+                    println!("\n✅ Balance found:");
+                    println!("   Address : {}", address);
+                    println!("   Balance : {} LYT  ({:.8} ACM)", balance_lyt, acm);
+                    println!("   UTXOs   : {}", utxo_count);
+                }
+                Err(e) => {
+                    println!("❌ Error calculating balance: {}", e);
+                }
+            }
         }
         Some("send") => {
             let to = args.get(3).ok_or("Recipient address required")?;
-            let amount = args.get(4).ok_or("Amount required")?;
-            println!("💸 Sending {} LYT to {}...", amount, to);
-            println!("   (requires running node with wallet)");
+            let amount_str = args.get(4).ok_or("Amount required")?;
+            let amount: u64 = amount_str.parse().map_err(|_| "Invalid amount")?;
+        
+            // 1. Загружаем кошелёк
+            let wallet_path = dirs::home_dir()
+                .ok_or("Cannot find home dir")?
+                .join(".accum")
+                .join("wallet.json");
+        
+            if !wallet_path.exists() {
+                println!("❌ Wallet not found. Create one first: accum wallet create");
+                return Ok(());
+            }
+        
+            let content = std::fs::read_to_string(&wallet_path)?;
+            #[derive(serde::Deserialize)]
+            struct WalletFile {
+                private_key: String,
+            }
+            let wallet_data: WalletFile = serde_json::from_str(&content)?;
+            let secret_bytes = hex::decode(&wallet_data.private_key)
+                .map_err(|e| format!("Invalid private key hex: {}", e))?;
+            let wallet = Wallet::from_secret_key(&secret_bytes)?;
+        
+            println!("💳 From:   {}", wallet.address);
+            println!("📤 To:     {}", to);
+            println!("💰 Amount: {} LYT", amount);
+        
+            // 2. Открываем базу и получаем UTXO
+            let storage = ProductionStorage::new("mainnet")?;
+            let utxos = storage.get_utxos_by_address(&wallet.address)?;
+        
+            if utxos.is_empty() {
+                println!("❌ No UTXOs found for this address");
+                return Ok(());
+            }
+        
+            println!("📦 Found {} UTXO(s)", utxos.len());
+        
+            // 3. Создаём и подписываем транзакцию
+            let fee = 1000u64;
+            let tx = match wallet.create_simple_tx(&utxos, to, amount, fee) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    println!("❌ Failed to create transaction: {}", e);
+                    return Ok(());
+                }
+            };
+        
+            let tx_bytes = bincode::serialize(&tx).map_err(|e| e.to_string())?;
+            let tx_hex = hex::encode(&tx_bytes);
+        
+            println!("\n✅ Transaction created and signed");
+            println!("   Fee: {} LYT", fee);
+            println!("   Size: {} bytes", tx_bytes.len());
+        
+            // 4. Пытаемся отправить через RPC
+            println!("\n📡 Trying to broadcast via RPC (localhost:{})...", RPC_PORT);
+        
+            let client = reqwest::blocking::Client::new();
+            let url = format!("http://127.0.0.1:{}/transaction", RPC_PORT);
+        
+            match client
+                .post(&url)
+                .header("Content-Type", "text/plain")
+                .body(tx_hex.clone())
+                .send()
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let body = response.text().unwrap_or_default();
+                        println!("✅ Transaction successfully submitted to node!");
+                        println!("   Response: {}", body);
+                    } else {
+                        println!("⚠️  Node returned error: {}", response.status());
+                        println!("   Raw tx (hex) — you can submit it manually later:");
+                        println!("{}", tx_hex);
+                    }
+                }
+                Err(e) => {
+                    println!("⚠️  Could not connect to node RPC: {}", e);
+                    println!("   Make sure the node is running (`accum node`).");
+                    println!("\n   Raw tx (hex) — save it and submit later:");
+                    println!("{}", tx_hex);
+                }
+            }
         }
         _ => {
             println!("╔═══════════════════════════════════════════╗");
@@ -5559,10 +5825,37 @@ fn handle_restore_command(args: &[String]) -> Result<(), Box<dyn std::error::Err
 }
 
 fn handle_info_command() -> Result<(), Box<dyn std::error::Error>> {
-    println!("📡 Connecting to local node...");
-    println!("   (RPC endpoint: http://localhost:{})", RPC_PORT);
-    println!("\n💡 To get info, run:");
-    println!("   curl http://localhost:{}/info", RPC_PORT);
+    println!("📡 Reading local node information...\n");
+
+    let storage = match ProductionStorage::new("mainnet") {
+        Ok(s) => s,
+        Err(e) => {
+            println!("❌ Cannot open database: {}", e);
+            println!("   Run the node at least once: accum node");
+            return Ok(());
+        }
+    };
+
+    match storage.get_node_info() {
+        Ok((height, epoch, utxo_count)) => {
+            println!("╔══════════════════════════════════════════╗");
+            println!("║           ACCUM NODE INFO                ║");
+            println!("╚══════════════════════════════════════════╝");
+            println!();
+            println!("  Height        : {}", height);
+            println!("  Epoch         : {}", epoch);
+            println!("  UTXO count    : {}", utxo_count);
+            println!("  Network       : mainnet");
+            println!("  RPC port      : {}", RPC_PORT);
+            println!("  P2P port      : {}", P2P_PORT);
+            println!();
+            println!("💡 Database path: ~/.accum/mainnet");
+        }
+        Err(e) => {
+            println!("❌ Failed to read node info: {}", e);
+        }
+    }
+
     Ok(())
 }
 

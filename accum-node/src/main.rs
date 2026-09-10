@@ -5,34 +5,34 @@
 // FULLY WORKING NODE WITH SOLO MINING + EQUIVOCATION SLASHING
 // ============================================================
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::Arc;
-use std::cmp::Ordering;
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::io::{Read, Write};
-use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::env;
-use argon2::{Argon2, Algorithm, Version, Params};
-use sha2::{Sha256, Digest};
-use ripemd::Ripemd160;
-use rand::{RngCore, thread_rng};
-use rand::rngs::OsRng;
-use hex;
-use serde::{Deserialize, Serialize};
-use rocksdb::{DB, Options, IteratorMode};
-use rocksdb::checkpoint::Checkpoint as RocksdbCheckpoint;
+use argon2::{Algorithm, Argon2, Params, Version};
+use bincode;
 use dirs;
-use secp256k1::{Secp256k1, Message, PublicKey, SecretKey, ecdsa::Signature};
-use warp::Filter;
-use tokio::signal;
-use tokio::time::Duration;
+use hex;
 use lazy_static;
 use parking_lot::RwLock;
-use bincode;
+use rand::rngs::OsRng;
+use rand::{thread_rng, RngCore};
+use ripemd::Ripemd160;
+use rocksdb::checkpoint::Checkpoint as RocksdbCheckpoint;
+use rocksdb::{IteratorMode, Options, DB};
+use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::signal;
+use tokio::time::Duration;
 use toml;
+use warp::Filter;
 
 lazy_static::lazy_static! {
     static ref SECP: Secp256k1<secp256k1::All> = Secp256k1::new();
@@ -178,7 +178,7 @@ impl EquivocationProof {
     fn block_height_2(&self) -> Height {
         self.block_height
     }
-    
+
     /// Верификация доказательства эквивокации
     pub fn verify(
         &self,
@@ -188,53 +188,55 @@ impl EquivocationProof {
         // 1. Проверяем, что оба блока на одной высоте
         let block1_height = self.block_height;
         let block2_height = self.block_height;
-        
+
         // 2. Получаем блоки из storage
-        let block1 = storage.get_block(block1_height)?
+        let block1 = storage
+            .get_block(block1_height)?
             .ok_or("Block 1 not found")?;
-        let block2 = storage.get_block(block2_height)?
+        let block2 = storage
+            .get_block(block2_height)?
             .ok_or("Block 2 not found")?;
-        
+
         // 3. Проверяем, что это разные блоки
         if block1.header.hash(argon2) == block2.header.hash(argon2) {
             return Ok(false);
         }
-        
+
         // 4. Проверяем подписи
         let hash1 = block1.header.hash(argon2);
         let hash2 = block2.header.hash(argon2);
-        
+
         let sig1_ok = if let (Some(sig), Some(pubkey)) = (&block1.signature, &block1.pubkey) {
             Wallet::verify_signature(pubkey, sig, &hash1)
         } else {
             false
         };
-        
+
         let sig2_ok = if let (Some(sig), Some(pubkey)) = (&block2.signature, &block2.pubkey) {
             Wallet::verify_signature(pubkey, sig, &hash2)
         } else {
             false
         };
-        
+
         if !sig1_ok || !sig2_ok {
             return Ok(false);
         }
-        
+
         // 5. Проверяем, что оба блока подписаны одним miner_id
         let miner_id_from_block1 = Self::extract_miner_id_from_block(&block1)?;
         let miner_id_from_block2 = Self::extract_miner_id_from_block(&block2)?;
-        
+
         if miner_id_from_block1 != miner_id_from_block2 {
             return Ok(false);
         }
-        
+
         if miner_id_from_block1 != self.miner_id {
             return Ok(false);
         }
-        
+
         Ok(true)
     }
-    
+
     /// Извлечение miner_id из блока
     fn extract_miner_id_from_block(block: &Block) -> Result<MinerId, String> {
         if let Some(coinbase) = block.transactions.first() {
@@ -246,29 +248,30 @@ impl EquivocationProof {
                 }
             }
         }
-        
+
         if let Some(pubkey) = &block.pubkey {
             if let Ok(pk) = PublicKey::from_slice(pubkey) {
                 return Ok(Wallet::miner_id_from_pubkey(&pk));
             }
         }
-        
+
         Err("Cannot extract miner_id from block".to_string())
     }
-    
+
     /// Выполнение слэша (сжигание bond)
     pub fn execute_slash(
         &self,
         storage: &ProductionStorage,
         height: Height,
     ) -> Result<SlashRecord, String> {
-        let bond = storage.get_bond(&self.miner_id)?
+        let bond = storage
+            .get_bond(&self.miner_id)?
             .ok_or("No bond found for miner")?;
-        
+
         let amount = bond.amount;
-        
+
         storage.delete_bond(&self.miner_id)?;
-        
+
         let slash_record = SlashRecord {
             miner_id: self.miner_id,
             amount,
@@ -276,23 +279,26 @@ impl EquivocationProof {
             timestamp: current_timestamp(),
             proof: bincode::serialize(self).map_err(|e| e.to_string())?,
         };
-        
+
         storage.save_slash_record(height, &slash_record)?;
-        
-        println!("🔥 SLASHED: Miner {}... lost {} LYT for equivocation",
-                 hex::encode(&self.miner_id[0..8]), amount);
-        
+
+        println!(
+            "🔥 SLASHED: Miner {}... lost {} LYT for equivocation",
+            hex::encode(&self.miner_id[0..8]),
+            amount
+        );
+
         Ok(slash_record)
     }
-    
+
     /// Создание доказательства из двух блоков
     pub fn from_blocks(block1: &Block, block2: &Block, height: Height) -> Result<Self, String> {
         let miner_id = Self::extract_miner_id_from_block(block1)?;
-        
+
         let mut argon2 = Argon2Cache::new(100);
         let hash1 = block1.header.hash(&mut argon2);
         let hash2 = block2.header.hash(&mut argon2);
-        
+
         Ok(Self {
             miner_id,
             block_height: height,
@@ -325,13 +331,13 @@ impl SlashingPool {
             slash_height: 0,
         }
     }
-    
+
     fn add_proof(&mut self, proof: EquivocationProof) {
         if !self.processed_slashes.contains(&proof.miner_id) {
             self.pending_slashes.push(proof);
         }
     }
-    
+
     fn process_all(
         &mut self,
         storage: &ProductionStorage,
@@ -339,25 +345,25 @@ impl SlashingPool {
         current_height: Height,
     ) -> Result<Vec<SlashRecord>, String> {
         let mut results = Vec::new();
-        
+
         for proof in &self.pending_slashes {
             if self.processed_slashes.contains(&proof.miner_id) {
                 continue;
             }
-            
+
             if proof.verify(storage, argon2)? {
                 let record = proof.execute_slash(storage, current_height)?;
                 self.processed_slashes.insert(proof.miner_id);
                 results.push(record);
             }
         }
-        
+
         self.pending_slashes.clear();
         self.slash_height = current_height;
-        
+
         Ok(results)
     }
-    
+
     fn is_slashed(&self, miner_id: &MinerId) -> bool {
         self.processed_slashes.contains(miner_id)
     }
@@ -388,46 +394,68 @@ impl AttackDetection {
             detection_time: None,
         }
     }
-    
+
     fn record_hash_rate(&mut self, hash_rate: f64) {
-        self.hash_rate_history.push_back((current_timestamp(), hash_rate));
+        self.hash_rate_history
+            .push_back((current_timestamp(), hash_rate));
         while self.hash_rate_history.len() > 1000 {
             self.hash_rate_history.pop_front();
         }
     }
-    
+
     fn record_block_interval(&mut self, interval_secs: u64) {
-        self.block_interval_history.push_back((current_timestamp(), interval_secs));
+        self.block_interval_history
+            .push_back((current_timestamp(), interval_secs));
         while self.block_interval_history.len() > 1000 {
             self.block_interval_history.pop_front();
         }
     }
-    
+
     fn detect_51_percent_attack(&mut self, _node_total_hash_rate: f64) -> bool {
         if self.hash_rate_history.len() < 100 {
             return false;
         }
-        
-        let recent: Vec<f64> = self.hash_rate_history.iter().rev().take(100).map(|(_, hr)| *hr).collect();
-        let previous: Vec<f64> = self.hash_rate_history.iter().rev().skip(100).take(100).map(|(_, hr)| *hr).collect();
-        
+
+        let recent: Vec<f64> = self
+            .hash_rate_history
+            .iter()
+            .rev()
+            .take(100)
+            .map(|(_, hr)| *hr)
+            .collect();
+        let previous: Vec<f64> = self
+            .hash_rate_history
+            .iter()
+            .rev()
+            .skip(100)
+            .take(100)
+            .map(|(_, hr)| *hr)
+            .collect();
+
         if previous.is_empty() {
             return false;
         }
-        
+
         let recent_avg = recent.iter().sum::<f64>() / recent.len() as f64;
         let previous_avg = previous.iter().sum::<f64>() / previous.len() as f64;
-        
+
         if recent_avg > previous_avg * 5.0 && previous_avg > 0.0 {
             self.attack_detected = true;
             self.attack_type = Some("hash_rate_spike".to_string());
             self.detection_time = Some(current_timestamp());
             return true;
         }
-        
-        let recent_intervals: Vec<u64> = self.block_interval_history.iter().rev().take(50).map(|(_, i)| *i).collect();
+
+        let recent_intervals: Vec<u64> = self
+            .block_interval_history
+            .iter()
+            .rev()
+            .take(50)
+            .map(|(_, i)| *i)
+            .collect();
         if !recent_intervals.is_empty() {
-            let avg_interval = recent_intervals.iter().sum::<u64>() as f64 / recent_intervals.len() as f64;
+            let avg_interval =
+                recent_intervals.iter().sum::<u64>() as f64 / recent_intervals.len() as f64;
             if avg_interval < TARGET_BLOCK_TIME as f64 * 0.3 {
                 self.attack_detected = true;
                 self.attack_type = Some("block_time_anomaly".to_string());
@@ -435,18 +463,18 @@ impl AttackDetection {
                 return true;
             }
         }
-        
+
         false
     }
-    
+
     fn mark_peer_suspicious(&mut self, peer_id: PeerId) {
         self.suspicious_peers.insert(peer_id);
     }
-    
+
     fn is_peer_suspicious(&self, peer_id: &PeerId) -> bool {
         self.suspicious_peers.contains(peer_id)
     }
-    
+
     fn clear(&mut self) {
         self.attack_detected = false;
         self.attack_type = None;
@@ -518,78 +546,81 @@ impl DDoSProtection {
             attack_mode: false,
         }
     }
-    
+
     fn check_rate_limit(&mut self, addr: SocketAddr) -> bool {
         let now = current_timestamp();
-        
+
         if self.ip_whitelist.contains(&addr) {
             return true;
         }
-        
+
         if self.ip_blacklist.contains(&addr) {
             return false;
         }
-        
+
         let limit = self.rate_limits.entry(addr).or_insert(RateLimit {
             requests: 0,
             last_hour: now,
             last_minute: now,
             minute_requests: 0,
         });
-        
+
         if now - limit.last_hour > 3600 {
             limit.requests = 0;
             limit.last_hour = now;
         }
-        
+
         if now - limit.last_minute > 60 {
             limit.minute_requests = 0;
             limit.last_minute = now;
         }
-        
+
         limit.requests += 1;
         limit.minute_requests += 1;
         self.global_request_count += 1;
-        
+
         let max_per_hour = if self.attack_mode { 100 } else { 1000 };
         let max_per_minute = if self.attack_mode { 10 } else { 100 };
-        
+
         if limit.requests > max_per_hour || limit.minute_requests > max_per_minute {
             self.ip_blacklist.insert(addr);
             return false;
         }
-        
+
         true
     }
-    
+
     fn check_connection_limit(&mut self, addr: SocketAddr) -> bool {
         let now = current_timestamp();
-        
+
         if self.ip_blacklist.contains(&addr) {
             return false;
         }
-        
-        let limit = self.connection_limits.entry(addr).or_insert(ConnectionLimit {
-            connections: 0,
-            last_reset: now,
-            failures: 0,
-        });
-        
+
+        let limit = self
+            .connection_limits
+            .entry(addr)
+            .or_insert(ConnectionLimit {
+                connections: 0,
+                last_reset: now,
+                failures: 0,
+            });
+
         if now - limit.last_reset > 60 {
             limit.connections = 0;
             limit.last_reset = now;
         }
-        
+
         let max_connections = if self.attack_mode { 5 } else { 50 };
-        
+
         if limit.connections >= max_connections {
             return false;
         }
-        
+
         limit.connections += 1;
         true
     }
-    
+
     fn record_failure(&mut self, addr: SocketAddr) {
         if let Some(limit) = self.connection_limits.get_mut(&addr) {
             limit.failures += 1;
@@ -598,33 +629,35 @@ impl DDoSProtection {
             }
         }
     }
-    
+
     fn whitelist_ip(&mut self, addr: SocketAddr) {
         self.ip_whitelist.insert(addr);
         self.ip_blacklist.remove(&addr);
     }
-    
+
     fn blacklist_ip(&mut self, addr: SocketAddr) {
         self.ip_blacklist.insert(addr);
         self.ip_whitelist.remove(&addr);
     }
-    
+
     fn enable_attack_mode(&mut self) {
         self.attack_mode = true;
     }
-    
+
     fn disable_attack_mode(&mut self) {
         self.attack_mode = false;
     }
-    
+
     fn global_rate(&self) -> f64 {
         let now = current_timestamp();
         let elapsed = now - self.last_reset;
-        if elapsed == 0 { 0.0 } else {
+        if elapsed == 0 {
+            0.0
+        } else {
             self.global_request_count as f64 / elapsed as f64
         }
     }
-    
+
     fn is_banned(&self, addr: &SocketAddr) -> bool {
         self.ip_blacklist.contains(addr)
     }
@@ -736,24 +769,24 @@ impl Config {
         let mut path = dirs::home_dir().ok_or("Cannot find home dir")?;
         path.push(".accum");
         path.push("config.toml");
-        
+
         if !path.exists() {
             println!("📝 Config not found, creating default");
             let default = Self::default();
             default.save()?;
             return Ok(default);
         }
-        
+
         let contents = fs::read_to_string(path).map_err(|e| e.to_string())?;
         toml::from_str(&contents).map_err(|e| e.to_string())
     }
-    
+
     fn save(&self) -> Result<(), String> {
         let mut path = dirs::home_dir().ok_or("Cannot find home dir")?;
         path.push(".accum");
         fs::create_dir_all(&path).map_err(|e| e.to_string())?;
         path.push("config.toml");
-        
+
         let contents = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(path, contents).map_err(|e| e.to_string())?;
         Ok(())
@@ -770,13 +803,12 @@ struct Target([u8; 32]);
 impl Target {
     fn genesis() -> Self {
         Target([
-            0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
         ])
     }
-    
+
     fn is_met_by(&self, hash: &Hash32) -> bool {
         for i in 0..32 {
             match hash[i].cmp(&self.0[i]) {
@@ -787,54 +819,54 @@ impl Target {
         }
         true
     }
-    
+
     fn share_target(&self) -> Self {
         let mut result = [0u8; 32];
         let mut carry = 0u32;
-        
+
         for i in (0..32).rev() {
             let val = (self.0[i] as u32) * SHARE_DIFFICULTY_RATIO as u32 + carry;
             result[i] = (val & 0xFF) as u8;
             carry = val >> 8;
         }
-        
+
         if carry > 0 {
             return Target([0xFF; 32]);
         }
         Target(result)
     }
-    
+
     fn prefilter_target(&self) -> Self {
         let share_target = self.share_target();
         let mut result = [0u8; 32];
         let mut carry = 0u64;
-        
+
         for i in (0..32).rev() {
             let val = (share_target.0[i] as u64) * SHARE_PREFILTER_RATIO + carry;
             result[i] = (val & 0xFF) as u8;
             carry = val >> 8;
         }
-        
+
         if carry > 0 {
             return Target([0xFF; 32]);
         }
         Target(result)
     }
-    
+
     fn adjust(&self, factor: f64) -> Self {
         let mut result = [0u8; 32];
         let mut carry = 0u64;
         let factor_fixed = (factor * 1_000_000.0) as u64;
-        
+
         for i in (0..32).rev() {
             let val = (self.0[i] as u64) * factor_fixed + carry;
             result[i] = (val / 1_000_000) as u8;
             carry = val % 1_000_000;
         }
-        
+
         Target(result)
     }
-    
+
     fn to_difficulty(&self) -> f64 {
         let mut target_val = 0u128;
         for i in 0..32 {
@@ -868,14 +900,11 @@ impl Argon2Cache {
             ARGON2_ITERATIONS,
             ARGON2_PARALLELISM,
             Some(ARGON2_HASH_LEN),
-        ).expect("Invalid Argon2 parameters");
-        
-        let argon2 = Argon2::new(
-            Algorithm::Argon2id,
-            Version::V0x13,
-            params,
-        );
-        
+        )
+        .expect("Invalid Argon2 parameters");
+
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
         Self {
             argon2,
             cache: HashMap::with_capacity(max_size),
@@ -886,23 +915,23 @@ impl Argon2Cache {
             total_hashes: 0,
         }
     }
-    
+
     fn hash(&mut self, data: &[u8]) -> Hash32 {
         let now = current_timestamp();
         let start = std::time::Instant::now();
-        
+
         let key = data.to_vec();
-        
+
         if let Some((hash, time)) = self.cache.get(&key) {
             if now - *time < 60 {
                 self.hits += 1;
                 return *hash;
             }
         }
-        
+
         self.misses += 1;
         let mut output = [0u8; 32];
-        
+
         // ✅ ГЕНЕРИРУЕМ УНИКАЛЬНЫЙ SALT НА ОСНОВЕ ДАННЫХ
         let mut salt = [0u8; 16];
         let mut combined = Vec::with_capacity(16 + data.len());
@@ -910,30 +939,30 @@ impl Argon2Cache {
         combined.extend_from_slice(data);
         let salt_hash = Sha256::digest(&combined);
         salt.copy_from_slice(&salt_hash[0..16]);
-        
+
         self.argon2
             .hash_password_into(data, &salt, &mut output)
             .expect("Argon2 hashing failed");
-        
+
         if self.cache.len() >= self.max_size {
             self.cache.retain(|_, (_, t)| now - *t < 60);
         }
-        
+
         self.cache.insert(key, (output, now));
-        
+
         let elapsed = start.elapsed().as_millis() as u64;
         self.total_time += elapsed;
         self.total_hashes += 1;
-        
+
         output
     }
-    
+
     fn prefilter(header: &[u8; 120], nonce: u64, target: &Target) -> bool {
         let mut hasher = Sha256::new();
         hasher.update(header);
         hasher.update(nonce.to_le_bytes());
         let hash = hasher.finalize();
-        
+
         // target уже в правильном порядке (big-endian)
         // hash из Sha256 тоже в правильном порядке
         for i in 0..8 {
@@ -943,9 +972,9 @@ impl Argon2Cache {
                 Ordering::Equal => continue,
             }
         }
-        true  // равны
+        true // равны
     }
-    
+
     fn stats(&self) -> (u64, u64, f64) {
         let avg_time = if self.total_hashes > 0 {
             self.total_time as f64 / self.total_hashes as f64
@@ -957,7 +986,7 @@ impl Argon2Cache {
 }
 
 // ============================================================
-// WALLET 
+// WALLET
 // ============================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -978,10 +1007,10 @@ impl Wallet {
     fn generate() -> Result<Self, String> {
         let mut rng = OsRng;
         let (secret_key, public_key) = SECP.generate_keypair(&mut rng);
-        
+
         let miner_id = Self::miner_id_from_pubkey(&public_key);
         let address = Self::address_from_miner_id(&miner_id);
-        
+
         Ok(Self {
             secret_key: secret_key.secret_bytes().to_vec(),
             public_key: public_key.serialize().to_vec(),
@@ -989,20 +1018,19 @@ impl Wallet {
             address,
         })
     }
-    
+
     fn from_secret_key(secret_bytes: &[u8]) -> Result<Self, String> {
         if secret_bytes.len() != 32 {
             return Err("Invalid secret key length".to_string());
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(secret_bytes);
-        let secret_key = SecretKey::from_slice(&arr)
-            .map_err(|_| "Invalid secret key")?;
+        let secret_key = SecretKey::from_slice(&arr).map_err(|_| "Invalid secret key")?;
         let public_key = PublicKey::from_secret_key(&SECP, &secret_key);
-        
+
         let miner_id = Self::miner_id_from_pubkey(&public_key);
         let address = Self::address_from_miner_id(&miner_id);
-        
+
         Ok(Self {
             secret_key: secret_key.secret_bytes().to_vec(),
             public_key: public_key.serialize().to_vec(),
@@ -1010,69 +1038,67 @@ impl Wallet {
             address,
         })
     }
-    
+
     fn miner_id_from_pubkey(pubkey: &PublicKey) -> MinerId {
         let compressed = pubkey.serialize();
         let sha256 = Sha256::digest(&compressed);
         let ripemd160 = Ripemd160::digest(&sha256);
-        
+
         let mut miner_id = [0u8; 20];
         miner_id.copy_from_slice(&ripemd160);
         miner_id
     }
-    
+
     fn address_from_miner_id(miner_id: &MinerId) -> String {
         let mut with_version = vec![0x00];
         with_version.extend_from_slice(miner_id);
-        
+
         let checksum = &Sha256::digest(&Sha256::digest(&with_version))[0..4];
         with_version.extend_from_slice(checksum);
-        
+
         bs58::encode(with_version).into_string()
     }
-    
+
     fn verify_signature(pubkey_bytes: &[u8], signature: &[u8], message: &[u8]) -> bool {
         if pubkey_bytes.len() != 33 && pubkey_bytes.len() != 65 {
             return false;
         }
-        
+
         let pubkey = match PublicKey::from_slice(pubkey_bytes) {
             Ok(pk) => pk,
             Err(_) => return false,
         };
-        
+
         let msg_hash = Sha256::digest(message);
         let msg = match Message::from_digest_slice(&msg_hash) {
             Ok(m) => m,
             Err(_) => return false,
         };
-        
+
         let sig = match Signature::from_compact(signature) {
             Ok(s) => s,
             Err(_) => return false,
         };
-        
+
         SECP.verify_ecdsa(&msg, &sig, &pubkey).is_ok()
     }
-    
+
     fn sign_block(&self, block_hash: &Hash32) -> Result<Vec<u8>, String> {
         self.sign(block_hash)
     }
-    
+
     fn sign(&self, message: &[u8; 32]) -> Result<Vec<u8>, String> {
         if self.secret_key.len() != 32 {
             return Err("Invalid secret key".to_string());
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&self.secret_key);
-        let secret_key = SecretKey::from_slice(&arr)
-            .map_err(|e| e.to_string())?;
-        let msg = Message::from_digest_slice(message)
-            .map_err(|e| e.to_string())?;
+        let secret_key = SecretKey::from_slice(&arr).map_err(|e| e.to_string())?;
+        let msg = Message::from_digest_slice(message).map_err(|e| e.to_string())?;
         let sig = SECP.sign_ecdsa(&msg, &secret_key);
         Ok(sig.serialize_compact().to_vec())
     }
-    
+
     fn public_key_bytes(&self) -> &[u8] {
         &self.public_key
     }
@@ -1087,10 +1113,10 @@ impl Wallet {
         if amount == 0 {
             return Err("Amount must be greater than 0".to_string());
         }
-    
+
         let mut selected = Vec::new();
         let mut total_in = 0u64;
-    
+
         for (outpoint, output) in utxos {
             selected.push((outpoint.clone(), output.clone()));
             total_in += output.value;
@@ -1098,7 +1124,7 @@ impl Wallet {
                 break;
             }
         }
-    
+
         if total_in < amount + fee {
             return Err(format!(
                 "Insufficient funds. Need {} LYT, have {} LYT",
@@ -1106,9 +1132,9 @@ impl Wallet {
                 total_in
             ));
         }
-    
+
         let change = total_in - amount - fee;
-    
+
         // Входы
         let mut inputs = Vec::new();
         for (outpoint, _) in &selected {
@@ -1119,38 +1145,38 @@ impl Wallet {
                 sequence: 0xFFFFFFFF,
             });
         }
-    
+
         // Выходы
         let mut outputs = Vec::new();
-    
+
         // Получатель
         let mut recipient = TxOut::create_p2pkh(to_address)?;
         recipient.value = amount;
         outputs.push(recipient);
-    
+
         // Сдача (если есть)
         if change > DUST_LIMIT_LYT {
             let mut change_out = TxOut::create_p2pkh(&self.address)?;
             change_out.value = change;
             outputs.push(change_out);
         }
-    
+
         let mut tx = Transaction {
             version: 1,
             inputs,
             outputs,
             locktime: 0,
         };
-    
+
         // Подписываем все входы (используем клон для вычисления sighash)
         for i in 0..tx.inputs.len() {
             let tx_clone = tx.clone();
             tx.inputs[i].sign(self, &tx_clone, i)?;
         }
-    
+
         Ok(tx)
     }
-}      
+}
 
 // ============================================================
 // БЛОК HEADER
@@ -1179,11 +1205,11 @@ impl BlockHeader {
             epoch_index: epoch,
         }
     }
-    
+
     fn to_bytes(&self) -> [u8; 120] {
         let mut bytes = [0u8; 120];
         let mut offset = 0;
-        
+
         bytes[offset..offset + 4].copy_from_slice(&self.version.to_le_bytes());
         offset += 4;
         bytes[offset..offset + 32].copy_from_slice(&self.prev_hash);
@@ -1197,38 +1223,42 @@ impl BlockHeader {
         bytes[offset..offset + 8].copy_from_slice(&self.nonce.to_le_bytes());
         offset += 8;
         bytes[offset..offset + 4].copy_from_slice(&self.epoch_index.to_le_bytes());
-        
+
         bytes
     }
-    
+
     fn hash(&self, argon2: &mut Argon2Cache) -> Hash32 {
         argon2.hash(&self.to_bytes())
     }
-    
+
     fn hash_with_nonce(&self, nonce: u64, argon2: &mut Argon2Cache) -> Hash32 {
         let mut header = self.clone();
         header.nonce = nonce;
         header.hash(argon2)
     }
-    
+
     fn meets_target(&self, argon2: &mut Argon2Cache) -> bool {
         let hash = self.hash(argon2);
         self.difficulty.is_met_by(&hash)
     }
-    
-    fn validate_timestamp(&self, prev_timestamp: Option<Timestamp>, _median: Option<Timestamp>) -> bool {
+
+    fn validate_timestamp(
+        &self,
+        prev_timestamp: Option<Timestamp>,
+        _median: Option<Timestamp>,
+    ) -> bool {
         let now = current_timestamp();
-        
+
         if self.timestamp > now + 7200 {
             return false;
         }
-        
+
         if let Some(prev) = prev_timestamp {
             if self.timestamp <= prev {
                 return false;
             }
         }
-        
+
         true
     }
 }
@@ -1261,7 +1291,7 @@ impl TxOut {
     fn is_bond(&self) -> bool {
         self.script_pubkey.len() == 21 && self.script_pubkey[0] == OP_BOND
     }
-    
+
     fn extract_miner_id(&self) -> Option<MinerId> {
         if self.is_bond() && self.script_pubkey.len() >= 21 {
             let mut id = [0u8; 20];
@@ -1271,20 +1301,20 @@ impl TxOut {
             None
         }
     }
-    
+
     fn is_dust(&self) -> bool {
         self.value < DUST_LIMIT_LYT
     }
-    
+
     fn is_p2pkh(&self) -> bool {
-        self.script_pubkey.len() == 25 &&
-        self.script_pubkey[0] == 0x76 &&
-        self.script_pubkey[1] == 0xA9 &&
-        self.script_pubkey[2] == 0x14 &&
-        self.script_pubkey[23] == 0x88 &&
-        self.script_pubkey[24] == 0xAC
+        self.script_pubkey.len() == 25
+            && self.script_pubkey[0] == 0x76
+            && self.script_pubkey[1] == 0xA9
+            && self.script_pubkey[2] == 0x14
+            && self.script_pubkey[23] == 0x88
+            && self.script_pubkey[24] == 0xAC
     }
-    
+
     fn extract_address(&self) -> Option<String> {
         if self.is_p2pkh() && self.script_pubkey.len() >= 23 {
             let pubkey_hash = &self.script_pubkey[3..23];
@@ -1297,13 +1327,15 @@ impl TxOut {
             None
         }
     }
-    
+
     fn create_p2pkh(address: &str) -> Result<Self, String> {
-        let decoded = bs58::decode(address).into_vec().map_err(|e| e.to_string())?;
+        let decoded = bs58::decode(address)
+            .into_vec()
+            .map_err(|e| e.to_string())?;
         if decoded.len() != 25 {
             return Err("Invalid address length".to_string());
         }
-        
+
         let pubkey_hash = &decoded[1..21];
         let mut script = Vec::with_capacity(25);
         script.push(0x76);
@@ -1312,7 +1344,7 @@ impl TxOut {
         script.extend_from_slice(pubkey_hash);
         script.push(0x88);
         script.push(0xAC);
-        
+
         Ok(TxOut {
             value: 0,
             script_pubkey: script,
@@ -1337,42 +1369,47 @@ impl TxIn {
             sequence: 0xFFFFFFFF,
         }
     }
-    
+
     fn is_coinbase(&self) -> bool {
         self.prev_txid == [0; 32] && self.prev_index == 0xFFFFFFFF
     }
-    
+
     fn outpoint(&self) -> OutPoint {
         (self.prev_txid, self.prev_index)
     }
-    
-    fn sign(&mut self, wallet: &Wallet, tx: &Transaction, input_index: usize) -> Result<(), String> {
+
+    fn sign(
+        &mut self,
+        wallet: &Wallet,
+        tx: &Transaction,
+        input_index: usize,
+    ) -> Result<(), String> {
         let sighash = tx.sighash(input_index);
         let signature = wallet.sign(&sighash)?;
-        
+
         let mut script_sig = Vec::new();
         let sig_der = signature;
         script_sig.push(sig_der.len() as u8);
         script_sig.extend_from_slice(&sig_der);
-        
+
         let pubkey = wallet.public_key_bytes();
         script_sig.push(pubkey.len() as u8);
         script_sig.extend_from_slice(pubkey);
-        
+
         self.script_sig = script_sig;
         Ok(())
     }
-    
+
     fn verify(&self, tx: &Transaction, input_index: usize, utxo: &TxOut) -> bool {
         if self.is_coinbase() {
             return true;
         }
-        
+
         let (sig_bytes, pubkey_bytes) = match self.parse_script_sig() {
             Some((sig, key)) => (sig, key),
             None => return false,
         };
-        
+
         if utxo.is_p2pkh() {
             self.verify_p2pkh(tx, input_index, utxo, pubkey_bytes, sig_bytes)
         } else if utxo.is_bond() {
@@ -1381,18 +1418,18 @@ impl TxIn {
             false
         }
     }
-    
+
     fn parse_script_sig(&self) -> Option<(&[u8], &[u8])> {
         if self.script_sig.len() < 2 {
             return None;
         }
-        
+
         let mut pos = 0;
-        
+
         if self.script_sig[pos] == 0x00 {
             pos += 1;
         }
-        
+
         if pos >= self.script_sig.len() {
             return None;
         }
@@ -1402,7 +1439,7 @@ impl TxIn {
         }
         let sig_bytes = &self.script_sig[pos + 1..pos + 1 + sig_len];
         pos += 1 + sig_len;
-        
+
         if pos >= self.script_sig.len() {
             return None;
         }
@@ -1411,60 +1448,72 @@ impl TxIn {
             return None;
         }
         let pubkey_bytes = &self.script_sig[pos + 1..];
-        
+
         Some((sig_bytes, pubkey_bytes))
     }
-    
-    fn verify_p2pkh(&self, tx: &Transaction, input_index: usize, utxo: &TxOut, 
-                     pubkey_bytes: &[u8], sig_bytes: &[u8]) -> bool {
+
+    fn verify_p2pkh(
+        &self,
+        tx: &Transaction,
+        input_index: usize,
+        utxo: &TxOut,
+        pubkey_bytes: &[u8],
+        sig_bytes: &[u8],
+    ) -> bool {
         let pubkey_hash = Ripemd160::digest(&Sha256::digest(pubkey_bytes));
         let expected_hash = &utxo.script_pubkey[3..23];
-        
+
         if &pubkey_hash[..] != expected_hash {
             return false;
         }
-        
+
         let sighash = tx.sighash(input_index);
         Self::verify_ecdsa(pubkey_bytes, sig_bytes, &sighash)
     }
-    
-    fn verify_bond(&self, tx: &Transaction, input_index: usize, utxo: &TxOut,
-                    pubkey_bytes: &[u8], sig_bytes: &[u8]) -> bool {
+
+    fn verify_bond(
+        &self,
+        tx: &Transaction,
+        input_index: usize,
+        utxo: &TxOut,
+        pubkey_bytes: &[u8],
+        sig_bytes: &[u8],
+    ) -> bool {
         let expected_miner_id = match utxo.extract_miner_id() {
             Some(id) => id,
             None => return false,
         };
-        
+
         let pubkey = match PublicKey::from_slice(pubkey_bytes) {
             Ok(p) => p,
             Err(_) => return false,
         };
         let actual_miner_id = Wallet::miner_id_from_pubkey(&pubkey);
-        
+
         if actual_miner_id != expected_miner_id {
             return false;
         }
-        
+
         let sighash = tx.sighash(input_index);
         Self::verify_ecdsa(pubkey_bytes, sig_bytes, &sighash)
     }
-    
+
     fn verify_ecdsa(pubkey_bytes: &[u8], sig_bytes: &[u8], msg: &[u8; 32]) -> bool {
         let pubkey = match PublicKey::from_slice(pubkey_bytes) {
             Ok(p) => p,
             Err(_) => return false,
         };
-        
+
         let message = match Message::from_digest_slice(msg) {
             Ok(m) => m,
             Err(_) => return false,
         };
-        
+
         let signature = match Signature::from_compact(sig_bytes) {
             Ok(s) => s,
             Err(_) => return false,
         };
-        
+
         SECP.verify_ecdsa(&message, &signature, &pubkey).is_ok()
     }
 }
@@ -1485,17 +1534,17 @@ impl Transaction {
             outputs,
             locktime: 0,
         };
-        
+
         tx.inputs[0].script_sig = height.to_le_bytes().to_vec();
         tx
     }
-    
+
     fn txid(&self, _argon2: &mut Argon2Cache) -> Txid {
         let mut data = Vec::new();
-        
+
         data.extend_from_slice(&self.version.to_le_bytes());
         data.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
-        
+
         for input in &self.inputs {
             data.extend_from_slice(&input.prev_txid);
             data.extend_from_slice(&input.prev_index.to_le_bytes());
@@ -1503,69 +1552,69 @@ impl Transaction {
             data.extend_from_slice(&input.script_sig);
             data.extend_from_slice(&input.sequence.to_le_bytes());
         }
-        
+
         data.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for output in &self.outputs {
             data.extend_from_slice(&output.value.to_le_bytes());
             data.extend_from_slice(&(output.script_pubkey.len() as u32).to_le_bytes());
             data.extend_from_slice(&output.script_pubkey);
         }
-        
+
         data.extend_from_slice(&self.locktime.to_le_bytes());
-        
+
         let hash1 = Sha256::digest(&data);
         let hash2 = Sha256::digest(&hash1);
-        
+
         let mut txid = [0u8; 32];
         txid.copy_from_slice(&hash2);
         txid
     }
-    
+
     fn is_coinbase(&self) -> bool {
         self.inputs.len() == 1 && self.inputs[0].is_coinbase()
     }
-    
+
     fn sighash(&self, input_index: usize) -> [u8; 32] {
         let mut data = Vec::new();
-        
+
         data.extend_from_slice(&self.version.to_le_bytes());
         data.extend_from_slice(&(self.inputs.len() as u32).to_le_bytes());
-        
+
         for (i, input) in self.inputs.iter().enumerate() {
             data.extend_from_slice(&input.prev_txid);
             data.extend_from_slice(&input.prev_index.to_le_bytes());
-            
+
             if i == input_index {
                 data.extend_from_slice(&(0u32).to_le_bytes());
             } else {
                 data.extend_from_slice(&(input.script_sig.len() as u32).to_le_bytes());
                 data.extend_from_slice(&input.script_sig);
             }
-            
+
             data.extend_from_slice(&input.sequence.to_le_bytes());
         }
-        
+
         data.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for output in &self.outputs {
             data.extend_from_slice(&output.value.to_le_bytes());
             data.extend_from_slice(&(output.script_pubkey.len() as u32).to_le_bytes());
             data.extend_from_slice(&output.script_pubkey);
         }
-        
+
         data.extend_from_slice(&self.locktime.to_le_bytes());
         data.extend_from_slice(&0x01u32.to_le_bytes());
-        
+
         let hash = Sha256::digest(&Sha256::digest(&data));
         let mut result = [0u8; 32];
         result.copy_from_slice(&hash);
         result
     }
-    
+
     fn validate_basic(&self) -> Result<(), &'static str> {
         if self.inputs.is_empty() || self.outputs.is_empty() {
             return Err("Empty transaction");
         }
-        
+
         let mut seen = HashSet::new();
         for input in &self.inputs {
             if !input.is_coinbase() {
@@ -1576,65 +1625,67 @@ impl Transaction {
                 seen.insert(outpoint);
             }
         }
-        
+
         for output in &self.outputs {
             if output.is_dust() {
                 return Err("Dust output");
             }
         }
-        
+
         let total_out: u64 = self.outputs.iter().map(|o| o.value).sum();
         if total_out > MAX_SUPPLY_LYT {
             return Err("Output sum exceeds max supply");
         }
-        
+
         Ok(())
     }
-    
+
     fn validate(&self, storage: &ProductionStorage) -> Result<u64, &'static str> {
         self.validate_basic()?;
-        
+
         if self.is_coinbase() {
             return Ok(0);
         }
-        
+
         let mut input_sum = 0u64;
-        
+
         for (i, input) in self.inputs.iter().enumerate() {
-            let utxo = storage.get_utxo(&input.outpoint())
+            let utxo = storage
+                .get_utxo(&input.outpoint())
                 .map_err(|_| "DB error")?
                 .ok_or("UTXO not found")?;
-            
-            input_sum = input_sum.checked_add(utxo.value)
-                .ok_or("Overflow")?;
-            
+
+            input_sum = input_sum.checked_add(utxo.value).ok_or("Overflow")?;
+
             if !input.verify(self, i, &utxo) {
                 return Err("Invalid signature");
             }
         }
-        
-        let output_sum: u64 = self.outputs.iter()
+
+        let output_sum: u64 = self
+            .outputs
+            .iter()
             .try_fold(0u64, |acc, out| acc.checked_add(out.value))
             .ok_or("Overflow")?;
-        
+
         if output_sum > input_sum {
             return Err("Outputs exceed inputs");
         }
-        
+
         let fee = input_sum - output_sum;
-        
+
         if fee < MINIMUM_FEE_LYT {
             return Err("Fee below minimum");
         }
-        
+
         Ok(fee)
     }
-    
+
     fn fee(&self, storage: &ProductionStorage) -> Result<u64, String> {
         if self.is_coinbase() {
             return Ok(0);
         }
-        
+
         let mut input_sum = 0u64;
         for input in &self.inputs {
             let outpoint = input.outpoint();
@@ -1644,31 +1695,37 @@ impl Transaction {
                 return Err("UTXO not found".to_string());
             }
         }
-        
+
         let mut output_sum = 0u64;
         for output in &self.outputs {
             output_sum += output.value;
         }
-        
+
         if input_sum < output_sum {
             return Err("Insufficient input sum".to_string());
         }
-        
+
         Ok(input_sum - output_sum)
     }
-    
+
     fn serialize(&self) -> Vec<u8> {
         bincode::serialize(self).unwrap()
     }
-    
+
     fn deserialize(data: &[u8]) -> Result<Self, String> {
         bincode::deserialize(data).map_err(|e| e.to_string())
     }
-    
-    fn create_p2pkh(from: &Wallet, to: &str, amount: u64, fee: u64, utxos: Vec<(OutPoint, TxOut)>) -> Result<Self, String> {
+
+    fn create_p2pkh(
+        from: &Wallet,
+        to: &str,
+        amount: u64,
+        fee: u64,
+        utxos: Vec<(OutPoint, TxOut)>,
+    ) -> Result<Self, String> {
         let mut inputs = Vec::new();
         let mut input_sum = 0u64;
-        
+
         for (outpoint, utxo) in utxos {
             inputs.push(TxIn {
                 prev_txid: outpoint.0,
@@ -1677,43 +1734,43 @@ impl Transaction {
                 sequence: 0xFFFFFFFF,
             });
             input_sum += utxo.value;
-            
+
             if input_sum >= amount + fee {
                 break;
             }
         }
-        
+
         if input_sum < amount + fee {
             return Err("Insufficient funds".to_string());
         }
-        
+
         let mut outputs = Vec::new();
-        
+
         let mut to_output = TxOut::create_p2pkh(to)?;
         to_output.value = amount;
         outputs.push(to_output);
-        
+
         let change = input_sum - amount - fee;
         if change > DUST_LIMIT_LYT {
             let mut change_output = TxOut::create_p2pkh(&from.address)?;
             change_output.value = change;
             outputs.push(change_output);
         }
-        
+
         let mut tx = Transaction {
             version: 1,
             inputs,
             outputs,
             locktime: 0,
         };
-        
+
         let tx_clone = tx.clone();
         for (i, input) in tx.inputs.iter_mut().enumerate() {
             input.sign(from, &tx_clone, i)?;
         }
         Ok(tx)
     }
-}  
+}
 
 // ============================================================
 // PRODUCTION STORAGE
@@ -1738,9 +1795,9 @@ impl ProductionStorage {
         let mut path = dirs::home_dir().ok_or("Cannot find home dir")?;
         path.push(".accum");
         path.push(network);
-        
+
         std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-        
+
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -1749,30 +1806,38 @@ impl ProductionStorage {
         opts.set_max_write_buffer_number(3);
         opts.set_target_file_size_base(64 * 1024 * 1024);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        
+
         let cfs = vec![
-            CF_BLOCKS, CF_UTXO, CF_MINERS, CF_BONDS, 
-            CF_STATE, CF_MEMPOOL, CF_SLASHES, CF_CHECKPOINTS
+            CF_BLOCKS,
+            CF_UTXO,
+            CF_MINERS,
+            CF_BONDS,
+            CF_STATE,
+            CF_MEMPOOL,
+            CF_SLASHES,
+            CF_CHECKPOINTS,
         ];
-        let db = DB::open_cf(&opts, path.to_str().unwrap(), &cfs)
-            .map_err(|e| e.to_string())?;
-        
+        let db = DB::open_cf(&opts, path.to_str().unwrap(), &cfs).map_err(|e| e.to_string())?;
+
         println!("💾 Database initialized: {}", path.display());
         Ok(Self { db, path })
     }
-    
+
     fn cf_handle(&self, name: &str) -> &rocksdb::ColumnFamily {
-        self.db.cf_handle(name).expect(&format!("Column family {} not found", name))
+        self.db
+            .cf_handle(name)
+            .expect(&format!("Column family {} not found", name))
     }
-    
+
     fn save_block(&self, height: Height, block: &Block) -> Result<(), String> {
         let key = height.to_le_bytes();
         let value = bincode::serialize(block).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_BLOCKS), key, value)
+        self.db
+            .put_cf(self.cf_handle(CF_BLOCKS), key, value)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn get_block(&self, height: Height) -> Result<Option<Block>, String> {
         let key = height.to_le_bytes();
         match self.db.get_cf(self.cf_handle(CF_BLOCKS), key) {
@@ -1784,9 +1849,11 @@ impl ProductionStorage {
             Err(e) => Err(e.to_string()),
         }
     }
-    
+
     fn get_last_height(&self) -> Result<Height, String> {
-        let mut iter = self.db.iterator_cf(self.cf_handle(CF_BLOCKS), IteratorMode::End);
+        let mut iter = self
+            .db
+            .iterator_cf(self.cf_handle(CF_BLOCKS), IteratorMode::End);
         if let Some(Ok((key, _))) = iter.next() {
             let mut height_bytes = [0u8; 8];
             let key_slice = key.as_ref();
@@ -1800,15 +1867,16 @@ impl ProductionStorage {
             Ok(0)
         }
     }
-    
+
     fn save_utxo(&self, outpoint: &OutPoint, output: &TxOut) -> Result<(), String> {
         let key = bincode::serialize(outpoint).map_err(|e| e.to_string())?;
         let value = bincode::serialize(output).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_UTXO), key, value)
+        self.db
+            .put_cf(self.cf_handle(CF_UTXO), key, value)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, String> {
         let key = bincode::serialize(outpoint).map_err(|e| e.to_string())?;
         match self.db.get_cf(self.cf_handle(CF_UTXO), key) {
@@ -1824,29 +1892,33 @@ impl ProductionStorage {
     fn get_node_info(&self) -> Result<(Height, u32, u64), String> {
         let height = self.get_height()?;
         let epoch = self.get_state::<u32>("epoch")?.unwrap_or(1);
-        
+
         // Считаем примерное количество UTXO
         let mut utxo_count = 0u64;
-        let iter = self.db.iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
+        let iter = self
+            .db
+            .iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
         for item in iter {
             if item.is_ok() {
                 utxo_count += 1;
             }
         }
-        
+
         Ok((height, epoch, utxo_count))
     }
-    
+
     fn get_balance_by_address(&self, address: &str) -> Result<(u64, u64), String> {
         let mut total = 0u64;
         let mut utxo_count = 0u64;
-    
-        let iter = self.db.iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
-    
+
+        let iter = self
+            .db
+            .iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
+
         for item in iter {
             let (_key, value) = item.map_err(|e| e.to_string())?;
             let output: TxOut = bincode::deserialize(&value).map_err(|e| e.to_string())?;
-    
+
             if let Some(addr) = output.extract_address() {
                 if addr == address {
                     total = total.saturating_add(output.value);
@@ -1854,44 +1926,48 @@ impl ProductionStorage {
                 }
             }
         }
-    
+
         Ok((total, utxo_count))
     }
-    
+
     fn get_utxos_by_address(&self, address: &str) -> Result<Vec<(OutPoint, TxOut)>, String> {
         let mut result = Vec::new();
-    
-        let iter = self.db.iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
-    
+
+        let iter = self
+            .db
+            .iterator_cf(self.cf_handle(CF_UTXO), IteratorMode::Start);
+
         for item in iter {
             let (key, value) = item.map_err(|e| e.to_string())?;
             let outpoint: OutPoint = bincode::deserialize(&key).map_err(|e| e.to_string())?;
             let output: TxOut = bincode::deserialize(&value).map_err(|e| e.to_string())?;
-    
+
             if let Some(addr) = output.extract_address() {
                 if addr == address {
                     result.push((outpoint, output));
                 }
             }
         }
-    
+
         Ok(result)
     }
 
     fn delete_utxo(&self, outpoint: &OutPoint) -> Result<(), String> {
         let key = bincode::serialize(outpoint).map_err(|e| e.to_string())?;
-        self.db.delete_cf(self.cf_handle(CF_UTXO), key)
+        self.db
+            .delete_cf(self.cf_handle(CF_UTXO), key)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn save_miner(&self, miner_id: &MinerId, data: &MinerData) -> Result<(), String> {
         let value = bincode::serialize(data).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_MINERS), miner_id, value)
+        self.db
+            .put_cf(self.cf_handle(CF_MINERS), miner_id, value)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn get_miner(&self, miner_id: &MinerId) -> Result<Option<MinerData>, String> {
         match self.db.get_cf(self.cf_handle(CF_MINERS), miner_id) {
             Ok(Some(data)) => {
@@ -1902,14 +1978,15 @@ impl ProductionStorage {
             Err(e) => Err(e.to_string()),
         }
     }
-    
+
     fn save_bond(&self, miner_id: &MinerId, bond: &Bond) -> Result<(), String> {
         let value = bincode::serialize(bond).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_BONDS), miner_id, value)
+        self.db
+            .put_cf(self.cf_handle(CF_BONDS), miner_id, value)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn get_bond(&self, miner_id: &MinerId) -> Result<Option<Bond>, String> {
         match self.db.get_cf(self.cf_handle(CF_BONDS), miner_id) {
             Ok(Some(data)) => {
@@ -1920,29 +1997,32 @@ impl ProductionStorage {
             Err(e) => Err(e.to_string()),
         }
     }
-    
+
     fn delete_bond(&self, miner_id: &MinerId) -> Result<(), String> {
-        self.db.delete_cf(self.cf_handle(CF_BONDS), miner_id)
+        self.db
+            .delete_cf(self.cf_handle(CF_BONDS), miner_id)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn save_slash_record(&self, height: Height, record: &SlashRecord) -> Result<(), String> {
         let key = height.to_le_bytes();
         let value = bincode::serialize(record).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_SLASHES), key, value)
+        self.db
+            .put_cf(self.cf_handle(CF_SLASHES), key, value)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn save_checkpoint(&self, height: Height, checkpoint: &Checkpoint) -> Result<(), String> {
         let key = height.to_le_bytes();
         let value = bincode::serialize(checkpoint).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_CHECKPOINTS), key, value)
+        self.db
+            .put_cf(self.cf_handle(CF_CHECKPOINTS), key, value)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn get_checkpoint(&self, height: Height) -> Result<Option<Checkpoint>, String> {
         let key = height.to_le_bytes();
         match self.db.get_cf(self.cf_handle(CF_CHECKPOINTS), key) {
@@ -1954,9 +2034,11 @@ impl ProductionStorage {
             Err(e) => Err(e.to_string()),
         }
     }
-    
+
     fn get_latest_checkpoint(&self) -> Result<Option<(Height, Checkpoint)>, String> {
-        let mut iter = self.db.iterator_cf(self.cf_handle(CF_CHECKPOINTS), IteratorMode::End);
+        let mut iter = self
+            .db
+            .iterator_cf(self.cf_handle(CF_CHECKPOINTS), IteratorMode::End);
         if let Some(Ok((key, value))) = iter.next() {
             let mut height_bytes = [0u8; 8];
             let key_slice = key.as_ref();
@@ -1972,14 +2054,15 @@ impl ProductionStorage {
             Ok(None)
         }
     }
-    
+
     fn save_state<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<(), String> {
         let data = bincode::serialize(value).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_STATE), key.as_bytes(), data)
+        self.db
+            .put_cf(self.cf_handle(CF_STATE), key.as_bytes(), data)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn get_state<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, String> {
         match self.db.get_cf(self.cf_handle(CF_STATE), key.as_bytes()) {
             Ok(Some(data)) => {
@@ -1990,14 +2073,15 @@ impl ProductionStorage {
             Err(e) => Err(e.to_string()),
         }
     }
-    
+
     fn save_mempool(&self, txs: &[Transaction]) -> Result<(), String> {
         let value = bincode::serialize(txs).map_err(|e| e.to_string())?;
-        self.db.put_cf(self.cf_handle(CF_MEMPOOL), b"mempool", value)
+        self.db
+            .put_cf(self.cf_handle(CF_MEMPOOL), b"mempool", value)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    
+
     fn load_mempool(&self) -> Result<Vec<Transaction>, String> {
         match self.db.get_cf(self.cf_handle(CF_MEMPOOL), b"mempool") {
             Ok(Some(data)) => {
@@ -2008,7 +2092,7 @@ impl ProductionStorage {
             Err(e) => Err(e.to_string()),
         }
     }
-    
+
     fn get_height(&self) -> Result<Height, String> {
         match self.get_state::<Height>("height") {
             Ok(Some(h)) => Ok(h),
@@ -2016,25 +2100,26 @@ impl ProductionStorage {
             Err(e) => Err(e),
         }
     }
-    
+
     pub fn backup(&self) -> Result<String, String> {
         let backup_dir = self.path.join("backups");
         std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
-        
+
         let timestamp = current_timestamp();
         let backup_path = backup_dir.join(timestamp.to_string());
-        
+
         println!("💾 Creating backup at {}", backup_path.display());
-        
+
         let checkpoint = RocksdbCheckpoint::new(&self.db)
             .map_err(|e| format!("Failed to create checkpoint: {}", e))?;
-        
-        checkpoint.create_checkpoint(&backup_path)
+
+        checkpoint
+            .create_checkpoint(&backup_path)
             .map_err(|e| format!("Failed to create checkpoint: {}", e))?;
-        
+
         let height = self.get_height()?;
         let epoch = self.get_state::<u32>("epoch")?.unwrap_or(1);
-        
+
         let metadata = serde_json::json!({
             "timestamp": timestamp,
             "height": height,
@@ -2043,15 +2128,18 @@ impl ProductionStorage {
             "created_at": chrono::Utc::now().to_rfc3339(),
             "backup_type": "full",
         });
-        
+
         let metadata_path = backup_path.join("metadata.json");
-        std::fs::write(metadata_path, serde_json::to_string_pretty(&metadata).unwrap())
-            .map_err(|e| e.to_string())?;
-        
+        std::fs::write(
+            metadata_path,
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+
         println!("✅ Backup created: {}", backup_path.display());
         Ok(timestamp.to_string())
     }
-    
+
     pub fn maybe_backup(&self, height: Height, interval_blocks: u64) -> Result<(), String> {
         if height % interval_blocks == 0 && height > 0 {
             self.backup()?;
@@ -2059,22 +2147,22 @@ impl ProductionStorage {
         }
         Ok(())
     }
-    
+
     fn prune_old_backups(&self, keep_count: usize) -> Result<(), String> {
         let backup_dir = self.path.join("backups");
-        
+
         if !backup_dir.exists() {
             return Ok(());
         }
-        
+
         let mut backups: Vec<_> = std::fs::read_dir(&backup_dir)
             .map_err(|e| e.to_string())?
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
             .collect();
-        
+
         backups.sort_by_key(|a| a.path());
-        
+
         if backups.len() > keep_count {
             let to_remove = backups.len() - keep_count;
             for old_backup in backups.iter().take(to_remove) {
@@ -2082,84 +2170,96 @@ impl ProductionStorage {
                 let _ = std::fs::remove_dir_all(old_backup.path());
             }
         }
-        
+
         Ok(())
     }
-    
+
     pub fn restore(&self, backup_timestamp: &str) -> Result<(), String> {
         let backup_path = self.path.join("backups").join(backup_timestamp);
-        
+
         if !backup_path.exists() {
             return Err(format!("Backup {} not found", backup_path.display()));
         }
-        
+
         println!("🔄 Restoring from {}", backup_path.display());
-        
+
         let metadata_path = backup_path.join("metadata.json");
         if metadata_path.exists() {
             let metadata = std::fs::read_to_string(metadata_path).map_err(|e| e.to_string())?;
             println!("📋 Backup metadata: {}", metadata);
         }
-        
+
         let backup_files: Vec<_> = std::fs::read_dir(&backup_path)
             .map_err(|e| e.to_string())?
             .filter_map(|e| e.ok())
             .collect();
-        
+
         if backup_files.is_empty() {
             return Err("Backup is empty".to_string());
         }
-        
+
         let current_backup = self.backup()?;
         println!("📦 Current database backed up as {}", current_backup);
-        
+
         self.db.flush_wal(true).map_err(|e| e.to_string())?;
-        
+
         let new_db_path = self.path.join(format!("restored_{}", backup_timestamp));
         if new_db_path.exists() {
             std::fs::remove_dir_all(&new_db_path).map_err(|e| e.to_string())?;
         }
-        
-        println!("✅ Database restored from backup: {}", backup_path.display());
+
+        println!(
+            "✅ Database restored from backup: {}",
+            backup_path.display()
+        );
         println!("⚠️ Please restart the node for changes to take effect");
-        
+
         Ok(())
     }
-    
+
     pub fn restore_from_checkpoint(&self, height: Height) -> Result<(), String> {
-        let checkpoint = self.get_checkpoint(height)?
+        let checkpoint = self
+            .get_checkpoint(height)?
             .ok_or(format!("Checkpoint at height {} not found", height))?;
-        
+
         println!("🔄 Restoring from checkpoint at height {}", height);
-        println!("   Block hash: {}", hex::encode(&checkpoint.block_hash[0..8]));
-        println!("   State root: {}", hex::encode(&checkpoint.state_root[0..8]));
-        
+        println!(
+            "   Block hash: {}",
+            hex::encode(&checkpoint.block_hash[0..8])
+        );
+        println!(
+            "   State root: {}",
+            hex::encode(&checkpoint.state_root[0..8])
+        );
+
         self.backup()?;
-        
+
         println!("✅ Checkpoint verification passed");
         println!("⚠️ Full state restoration requires node restart");
-        
+
         Ok(())
     }
-    
+
     pub fn export_for_migration(&self) -> Result<String, String> {
         let export_dir = self.path.join("export");
         std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
-        
+
         let timestamp = current_timestamp();
         let export_path = export_dir.join(format!("export_{}.json", timestamp));
-        
+
         let height = self.get_height()?;
         let epoch = self.get_state::<u32>("epoch")?.unwrap_or(1);
-        
+
         let mut miners_data = Vec::new();
-        let mut iter = self.db.iterator_cf(self.cf_handle(CF_MINERS), IteratorMode::Start);
+        let mut iter = self
+            .db
+            .iterator_cf(self.cf_handle(CF_MINERS), IteratorMode::Start);
         while let Some(Ok((_key, value))) = iter.next() {
             if let Ok(miner) = bincode::deserialize::<MinerData>(&value) {
                 miners_data.push(miner);
             }
         }
-        
+
         let export_data = serde_json::json!({
             "height": height,
             "epoch": epoch,
@@ -2169,16 +2269,19 @@ impl ProductionStorage {
             "miners": miners_data,
             "export_type": "migration",
         });
-        
-        std::fs::write(&export_path, serde_json::to_string_pretty(&export_data).unwrap())
-            .map_err(|e| e.to_string())?;
-        
+
+        std::fs::write(
+            &export_path,
+            serde_json::to_string_pretty(&export_data).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+
         println!("📤 Export created: {}", export_path.display());
         println!("   Miners exported: {}", miners_data.len());
-        
+
         Ok(export_path.to_string_lossy().to_string())
     }
-    
+
     pub fn flush(&self) -> Result<(), String> {
         self.db.flush().map_err(|e| e.to_string())
     }
@@ -2205,15 +2308,15 @@ impl Bond {
             miner_id,
         }
     }
-    
+
     fn is_active(&self, current_height: Height) -> bool {
-        current_height >= self.lock_until
+        current_height >= self.created_at && current_height < self.lock_until
     }
-    
+
     fn is_valid_for_poci(&self) -> bool {
         self.amount >= MINIMUM_BOND_LYT
     }
-    
+
     fn from_output(output: &TxOut, height: Height) -> Option<Self> {
         if let Some(miner_id) = output.extract_miner_id() {
             if output.value >= MINIMUM_BOND_LYT {
@@ -2225,7 +2328,7 @@ impl Bond {
             None
         }
     }
-    
+
     fn remaining_blocks(&self, current_height: Height) -> u64 {
         if current_height < self.lock_until {
             self.lock_until - current_height
@@ -2258,25 +2361,25 @@ impl LoyaltyData {
             grace_remaining: 0,
         }
     }
-    
+
     fn update(&mut self, current_epoch: u32, participated: bool) {
         if current_epoch <= self.last_epoch {
             return;
         }
-        
+
         let epochs_passed = current_epoch - self.last_epoch;
-        
+
         if participated {
             if epochs_passed > 1 {
                 for i in 0..(epochs_passed - 1) {
                     self.apply_decay(i == 0 && self.grace_remaining > 0);
                 }
             }
-            
+
             self.value += 1.0;
             self.consecutive_epochs += 1;
             self.missed_epochs = 0;
-            
+
             if self.grace_remaining < LOYALTY_GRACE_PERIOD {
                 self.grace_remaining = LOYALTY_GRACE_PERIOD;
             }
@@ -2284,18 +2387,18 @@ impl LoyaltyData {
             for i in 0..epochs_passed {
                 self.apply_decay(i == 0 && self.grace_remaining > 0);
             }
-            
+
             self.missed_epochs += epochs_passed;
             self.consecutive_epochs = 0;
-            
+
             if self.grace_remaining > 0 {
                 self.grace_remaining -= 1;
             }
         }
-        
+
         self.last_epoch = current_epoch;
     }
-    
+
     fn apply_decay(&mut self, use_grace: bool) {
         if use_grace {
             self.value *= LOYALTY_GRACE_DECAY_FACTOR;
@@ -2304,11 +2407,11 @@ impl LoyaltyData {
             self.value = (self.value * LOYALTY_DECAY_FACTOR).max(half);
         }
     }
-    
+
     fn get_loyalty_score(&self) -> f64 {
         self.value
     }
-    
+
     fn is_active(&self) -> bool {
         self.missed_epochs < LOYALTY_GRACE_PERIOD * 2
     }
@@ -2332,6 +2435,7 @@ struct MinerData {
     total_shares_historical: u64,
     blocks_found: u64,
     total_rewards: u64,
+    payout_address: Option<String>,
     first_seen: Timestamp,
 }
 
@@ -2350,6 +2454,7 @@ impl MinerData {
             total_shares_historical: 0,
             blocks_found: 0,
             total_rewards: 0,
+            payout_address: None,
             first_seen: time,
         }
     }
@@ -2415,7 +2520,7 @@ struct AggregatedShare {
     share_count: u32,
     merkle_root: Hash32,
     signature: Vec<u8>,
-    pubkey: Vec<u8>,         
+    pubkey: Vec<u8>,
     timestamp: Timestamp,
     epoch: u32,
 }
@@ -2425,38 +2530,36 @@ impl AggregatedShare {
         if shares.is_empty() {
             return Err("No shares to aggregate".to_string());
         }
-        
+
         let miner_id = shares[0].miner_id;
-        
+
         for share in shares {
             if share.miner_id != miner_id {
                 return Err("Shares from different miners".to_string());
             }
         }
-        
+
         let share_count = shares.len() as u32;
         let merkle_root = Self::build_merkle_root(shares);
         let timestamp = current_timestamp();
-        
+
         let message = Self::build_message(&miner_id, share_count, &merkle_root, epoch, timestamp);
         let signature = wallet.sign(&message)?;
-        
+
         Ok(Self {
             miner_id,
             share_count,
             merkle_root,
             signature,
-            pubkey: wallet.public_key_bytes().to_vec(),   // ← ДОБАВИЛИ
+            pubkey: wallet.public_key_bytes().to_vec(), // ← ДОБАВИЛИ
             timestamp,
             epoch,
         })
     }
-    
+
     fn build_merkle_root(shares: &[Share]) -> Hash32 {
-        let mut hashes: Vec<Hash32> = shares.iter()
-            .map(|s| s.share_hash())
-            .collect();
-        
+        let mut hashes: Vec<Hash32> = shares.iter().map(|s| s.share_hash()).collect();
+
         while hashes.len() > 1 {
             let mut next = Vec::new();
             for chunk in hashes.chunks(2) {
@@ -2474,7 +2577,7 @@ impl AggregatedShare {
         }
         hashes[0]
     }
-    
+
     fn build_message(
         miner_id: &MinerId,
         share_count: u32,
@@ -2488,41 +2591,41 @@ impl AggregatedShare {
         data.extend_from_slice(merkle_root);
         data.extend_from_slice(&epoch.to_le_bytes());
         data.extend_from_slice(&timestamp.to_le_bytes());
-        
+
         let hash = Sha256::digest(&data);
         hash.into()
     }
-    
+
     pub fn verify(&self, shares: &[Share]) -> Result<bool, String> {
         // 1. Количество shares
         if shares.len() as u32 != self.share_count {
             return Ok(false);
         }
-    
+
         // 2. Все shares от одного майнера
         for share in shares {
             if share.miner_id != self.miner_id {
                 return Ok(false);
             }
         }
-    
+
         // 3. Merkle root
         let computed_root = Self::build_merkle_root(shares);
         if computed_root != self.merkle_root {
             return Ok(false);
         }
-    
+
         // 4. Проверяем, что pubkey соответствует miner_id
         let pubkey = match PublicKey::from_slice(&self.pubkey) {
             Ok(pk) => pk,
             Err(_) => return Ok(false),
         };
-    
+
         let expected_miner_id = Wallet::miner_id_from_pubkey(&pubkey);
         if expected_miner_id != self.miner_id {
             return Ok(false);
         }
-    
+
         // 5. Проверяем подпись
         let message = Self::build_message(
             &self.miner_id,
@@ -2531,14 +2634,14 @@ impl AggregatedShare {
             self.epoch,
             self.timestamp,
         );
-    
+
         if !Wallet::verify_signature(&self.pubkey, &self.signature, &message) {
             return Ok(false);
         }
-    
+
         Ok(true)
     }
-    
+
     pub fn size_bytes(&self) -> usize {
         std::mem::size_of::<MinerId>() 
             + 4 
@@ -2570,21 +2673,21 @@ impl AggregatedSharePool {
             max_aggregates,
         }
     }
-    
+
     fn add_aggregate(&mut self, agg: AggregatedShare, shares: &[Share]) -> Result<bool, String> {
         if self.verified_roots.contains(&agg.merkle_root) {
             return Ok(false);
         }
-        
+
         // Теперь storage не нужен
         if !agg.verify(shares)? {
             return Ok(false);
         }
-        
+
         self.aggregates.insert(agg.miner_id, agg.clone());
         self.share_counts.insert(agg.miner_id, agg.share_count);
         self.verified_roots.insert(agg.merkle_root);
-        
+
         // Ограничение по количеству
         if self.aggregates.len() > self.max_aggregates {
             if let Some(oldest) = self.aggregates.keys().next().copied() {
@@ -2594,24 +2697,24 @@ impl AggregatedSharePool {
                 }
             }
         }
-        
+
         Ok(true)
     }
-    
+
     fn get_share_count(&self, miner_id: &MinerId) -> u32 {
         *self.share_counts.get(miner_id).unwrap_or(&0)
     }
-    
+
     fn new_epoch(&mut self) {
         self.aggregates.clear();
         self.share_counts.clear();
         self.verified_roots.clear();
     }
-    
+
     fn active_miners(&self) -> usize {
         self.aggregates.len()
     }
-    
+
     fn total_shares(&self) -> u32 {
         self.share_counts.values().sum()
     }
@@ -2627,20 +2730,20 @@ impl Share {
             timestamp: current_timestamp(),
         }
     }
-    
+
     fn share_hash(&self) -> Hash32 {
         let mut hasher = Sha256::new();
         hasher.update(&self.miner_id);
         hasher.update(&self.header.to_bytes());
         hasher.update(&self.nonce.to_le_bytes());
         hasher.update(&self.hash);
-        
+
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
         hash
     }
-    
+
     fn validate(
         &self,
         target_share: &Target,
@@ -2652,38 +2755,38 @@ impl Share {
         if self.header.prev_hash != *expected_prev_hash {
             return Err("Stale prev_hash");
         }
-        
+
         if self.header.epoch_index != expected_epoch {
             return Err("Wrong epoch");
         }
-        
+
         if self.timestamp < now - 7200 {
             return Err("Share too old");
         }
         if self.timestamp > now + 7200 {
             return Err("Share too far in future");
         }
-        
+
         if !Argon2Cache::prefilter(&self.header.to_bytes(), self.nonce, target_share) {
             return Err("Prefilter rejected");
         }
-        
+
         let computed_hash = self.header.hash_with_nonce(self.nonce, argon2);
         if computed_hash != self.hash {
             return Err("Hash mismatch");
         }
-        
+
         if !target_share.is_met_by(&self.hash) {
             return Err("Target not met");
         }
-        
+
         Ok(())
     }
-    
+
     fn to_p2p_bytes(&self) -> Vec<u8> {
         bincode::serialize(self).unwrap()
     }
-    
+
     fn from_p2p_bytes(data: &[u8]) -> Result<Self, String> {
         bincode::deserialize(data).map_err(|e| e.to_string())
     }
@@ -2719,89 +2822,92 @@ impl SharePool {
             created_at: current_timestamp(),
         }
     }
-    
+
     fn add_share(&mut self, share: Share, is_valid: bool) -> Result<bool, &'static str> {
         let miner_id = share.miner_id;
         let share_hash = share.share_hash();
-        
+
         if share.header.epoch_index != self.current_epoch {
             return Err("Wrong epoch");
         }
-        
+
         if self.share_hashes.contains(&share_hash) {
             return Ok(false);
         }
-        
+
         let total = self.total_shares.entry(miner_id).or_insert(0);
         *total += 1;
-        
+
         if !is_valid {
             let invalid = self.invalid_shares.entry(miner_id).or_insert(0);
             *invalid += 1;
             return Ok(false);
         }
-        
+
         let share_size = std::mem::size_of::<Share>();
         if self.memory_used + share_size > self.max_memory_bytes {
             self.evict_oldest()?;
         }
-        
+
         let count = self.share_count.entry(miner_id).or_insert(0);
         if *count >= MAX_SHARES_PER_MINER_PER_EPOCH {
             return Err("Max shares per miner exceeded");
         }
-        
-        self.shares.entry(miner_id).or_insert_with(Vec::new).push(share);
+
+        self.shares
+            .entry(miner_id)
+            .or_insert_with(Vec::new)
+            .push(share);
         self.share_hashes.insert(share_hash);
         self.memory_used += share_size;
         *count += 1;
-        
+
         Ok(true)
     }
-    
+
     fn evict_oldest(&mut self) -> Result<(), &'static str> {
         let mut target_miner = None;
         let mut max_shares = 0;
-        
+
         for (miner_id, shares) in &self.shares {
             if shares.len() > max_shares {
                 max_shares = shares.len();
                 target_miner = Some(*miner_id);
             }
         }
-        
+
         if let Some(miner_id) = target_miner {
             if let Some(shares) = self.shares.get_mut(&miner_id) {
                 if let Some(oldest) = shares.first() {
                     self.share_hashes.remove(&oldest.share_hash());
                     self.memory_used -= std::mem::size_of::<Share>();
                     shares.remove(0);
-                    
+
                     let count = self.share_count.entry(miner_id).or_insert(0);
                     *count -= 1;
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     fn miners(&self) -> Vec<MinerId> {
         self.shares.keys().copied().collect()
     }
-    
+
     fn get_shares(&self, miner_id: &MinerId) -> u64 {
         *self.share_count.get(miner_id).unwrap_or(&0)
     }
-    
+
     fn calculate_merkle_root(&self) -> Hash32 {
         if self.share_hashes.is_empty() {
             return [0; 32];
         }
-        
+
         let mut hashes: Vec<Hash32> = self.share_hashes.iter().copied().collect();
         hashes.sort();
-        
+
         let mut current = hashes;
         while current.len() > 1 {
             let mut next = Vec::new();
@@ -2822,7 +2928,7 @@ impl SharePool {
         }
         current[0]
     }
-    
+
     fn new_epoch(&mut self) {
         self.shares.clear();
         self.share_count.clear();
@@ -2833,7 +2939,7 @@ impl SharePool {
         self.current_epoch += 1;
         self.created_at = current_timestamp();
     }
-    
+
     fn invalid_ratio(&self, miner_id: &MinerId) -> f64 {
         let total = self.total_shares.get(miner_id).unwrap_or(&0);
         if *total == 0 {
@@ -2842,15 +2948,15 @@ impl SharePool {
         let invalid = self.invalid_shares.get(miner_id).unwrap_or(&0);
         *invalid as f64 / *total as f64
     }
-    
+
     fn total_shares_count(&self) -> u64 {
         self.share_count.values().sum()
     }
-    
+
     fn active_miners_count(&self) -> usize {
         self.shares.len()
     }
-    
+
     fn memory_usage_mb(&self) -> f64 {
         self.memory_used as f64 / (1024.0 * 1024.0)
     }
@@ -2943,10 +3049,10 @@ struct PeerConnection {
 impl PeerConnection {
     fn new(stream: TcpStream, address: SocketAddr) -> Self {
         let now = current_timestamp();
-        
+
         let mut peer_id = [0u8; 32];
         thread_rng().fill_bytes(&mut peer_id);
-        
+
         Self {
             peer_id,
             address,
@@ -2968,22 +3074,22 @@ impl PeerConnection {
             ping_time: None,
         }
     }
-    
+
     fn check_rate_limit(&mut self, current_time: Timestamp) -> bool {
         if current_time - self.last_hour_reset > 3600 {
             self.messages_this_hour = 0;
             self.last_hour_reset = current_time;
         }
-        
+
         if self.messages_this_hour >= MAX_MESSAGES_PER_HOUR {
             self.ban("Rate limit exceeded");
             return false;
         }
-        
+
         self.messages_this_hour += 1;
         true
     }
-    
+
     fn check_version(&self) -> Result<(), &'static str> {
         match self.version {
             Some(v) if v >= MIN_VERSION && v <= MAX_VERSION => Ok(()),
@@ -2994,45 +3100,44 @@ impl PeerConnection {
             None => Err("No version received"),
         }
     }
-    
+
     fn is_stale(&self, current_time: Timestamp) -> bool {
         current_time - self.last_message_time > PEER_TIMEOUT_SECS
     }
-    
+
     fn needs_heartbeat(&self, current_time: Timestamp) -> bool {
         current_time - self.last_heartbeat > 30
     }
-    
+
     fn send_message(&mut self, msg: &P2PMessage) -> Result<(), std::io::Error> {
         if self.banned {
             return Ok(());
         }
-        
-        let data = bincode::serialize(msg).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
-        
+
+        let data = bincode::serialize(msg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
         if data.len() > MAX_MESSAGE_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Message too large"
+                "Message too large",
             ));
         }
-        
+
         let len = (data.len() as u32).to_le_bytes();
-        
+
         self.stream.write_all(&len)?;
         self.stream.write_all(&data)?;
-        
+
         self.messages_sent += 1;
         self.last_message_time = current_timestamp();
-        
+
         Ok(())
     }
-    
+
     fn receive_message(&mut self) -> Result<Option<P2PMessage>, std::io::Error> {
         let mut len_buf = [0u8; 4];
-        
+
         match self.stream.read_exact(&mut len_buf) {
             Ok(()) => {
                 let len = u32::from_le_bytes(len_buf) as usize;
@@ -3041,27 +3146,27 @@ impl PeerConnection {
                     self.ban("Message too large");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "Message too large"
+                        "Message too large",
                     ));
                 }
-                
+
                 let mut data = vec![0u8; len];
                 self.stream.read_exact(&mut data)?;
-                
+
                 let msg: P2PMessage = bincode::deserialize(&data).map_err(|e| {
                     self.invalid_messages += 1;
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                 })?;
-                
+
                 let now = current_timestamp();
-                
+
                 if !self.check_rate_limit(now) {
                     return Ok(None);
                 }
-                
+
                 self.messages_received += 1;
                 self.last_message_time = now;
-                
+
                 match &msg {
                     P2PMessage::Heartbeat(nonce) => {
                         self.last_heartbeat = now;
@@ -3075,11 +3180,16 @@ impl PeerConnection {
                         }
                         self.last_heartbeat = now;
                     }
-                    P2PMessage::Version { height, best_hash, version, .. } => {
+                    P2PMessage::Version {
+                        height,
+                        best_hash,
+                        version,
+                        ..
+                    } => {
                         self.height = Some(*height);
                         self.best_hash = Some(*best_hash);
                         self.version = Some(*version);
-                        
+
                         if let Err(e) = self.check_version() {
                             self.ban(e);
                             return Ok(None);
@@ -3098,26 +3208,26 @@ impl PeerConnection {
                     }
                     _ => {}
                 }
-                
+
                 Ok(Some(msg))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
         }
     }
-    
+
     fn send_ping(&mut self) -> Result<(), std::io::Error> {
         let nonce = thread_rng().next_u64();
         self.ping_nonce = Some(nonce);
         self.send_message(&P2PMessage::Ping(nonce))
     }
-    
+
     fn update_state(&mut self, height: Height, hash: Hash32) {
         self.height = Some(height);
         self.best_hash = Some(hash);
         self.last_message_time = current_timestamp();
     }
-    
+
     fn ban(&mut self, reason: &str) {
         if self.banned {
             return;
@@ -3125,17 +3235,17 @@ impl PeerConnection {
         self.banned = true;
         self.ban_reason = Some(reason.to_string());
         println!("🚫 Peer {} banned: {}", self.address, reason);
-        
+
         let _ = self.send_message(&P2PMessage::BanPeer {
             peer_id: self.peer_id,
             reason: reason.to_string(),
         });
     }
-    
+
     fn is_banned(&self) -> bool {
         self.banned
     }
-    
+
     fn get_score(&self) -> f64 {
         if self.messages_received == 0 {
             return 0.0;
@@ -3144,19 +3254,19 @@ impl PeerConnection {
         let message_ratio = (self.messages_sent as f64 / self.messages_received as f64).min(1.0);
         valid_ratio * message_ratio
     }
-    
+
     fn get_height(&self) -> Option<Height> {
         self.height
     }
-    
+
     fn get_best_hash(&self) -> Option<Hash32> {
         self.best_hash
     }
-    
+
     fn get_peer_id(&self) -> PeerId {
         self.peer_id
     }
-    
+
     fn get_address(&self) -> SocketAddr {
         self.address
     }
@@ -3177,14 +3287,18 @@ struct P2PNode {
     local_height: Height,
     local_best_hash: Hash32,
     bootnodes: Vec<String>,
-    node: Arc<RwLock<Node>>,   
+    node: Arc<RwLock<Node>>,
 }
 
 impl P2PNode {
-    fn new(port: u16, bootnodes: Vec<String>, node: Arc<RwLock<Node>>) -> Result<Self, std::io::Error> {
+    fn new(
+        port: u16,
+        bootnodes: Vec<String>,
+        node: Arc<RwLock<Node>>,
+    ) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", port))?;
         listener.set_nonblocking(true)?;
-        
+
         Ok(Self {
             peers: HashMap::new(),
             listener,
@@ -3196,7 +3310,7 @@ impl P2PNode {
             local_height: 0,
             local_best_hash: [0; 32],
             bootnodes,
-            node,   // <-- сохраняем
+            node, // <-- сохраняем
         })
     }
 
@@ -3206,7 +3320,7 @@ impl P2PNode {
         self.sync_manager.set_chain(Vec::new(), HashMap::new());
         self.broadcast_version();
     }
-    
+
     fn broadcast_version(&mut self) {
         for peer in self.peers.values_mut() {
             let msg = P2PMessage::Version {
@@ -3219,25 +3333,25 @@ impl P2PNode {
             let _ = peer.send_message(&msg);
         }
     }
-    
+
     fn accept_connections(&mut self) -> Result<(), std::io::Error> {
         match self.listener.accept() {
             Ok((stream, addr)) => {
                 if !self.ddos_protection.check_connection_limit(addr) {
                     return Ok(());
                 }
-                
+
                 if self.peers.len() >= MAX_PEERS {
                     return Ok(());
                 }
-                
+
                 stream.set_nonblocking(true)?;
                 let mut peer = PeerConnection::new(stream, addr);
-                
+
                 if self.banned_peers.contains(&peer.get_peer_id()) {
                     return Ok(());
                 }
-                
+
                 let version_msg = P2PMessage::Version {
                     version: 1,
                     timestamp: current_timestamp(),
@@ -3246,7 +3360,7 @@ impl P2PNode {
                     peer_id: peer.get_peer_id(),
                 };
                 let _ = peer.send_message(&version_msg);
-                
+
                 println!("✅ New peer connected: {}", addr);
                 self.peers.insert(addr, peer);
                 self.known_peers.insert(addr);
@@ -3256,23 +3370,23 @@ impl P2PNode {
         }
         Ok(())
     }
-    
+
     fn process_messages(&mut self) -> Result<(), std::io::Error> {
         let now = current_timestamp();
         let mut disconnected = Vec::new();
         let mut messages_to_handle = Vec::new();
-        
+
         // Собираем все сообщения
         for (addr, peer) in self.peers.iter_mut() {
             if peer.is_banned() || peer.is_stale(now) {
                 disconnected.push(*addr);
                 continue;
             }
-            
+
             if peer.needs_heartbeat(now) {
                 let _ = peer.send_ping();
             }
-            
+
             loop {
                 match peer.receive_message() {
                     Ok(Some(msg)) => {
@@ -3295,12 +3409,12 @@ impl P2PNode {
                 }
             }
         }
-        
+
         // Обрабатываем сообщения - ЗДЕСЬ ГЛАВНОЕ ИЗМЕНЕНИЕ
         for (msg, addr) in messages_to_handle {
             self.handle_message(msg, addr);
         }
-        
+
         // Удаляем отключенных пиров
         for addr in disconnected {
             if let Some(peer) = self.peers.remove(&addr) {
@@ -3308,7 +3422,7 @@ impl P2PNode {
                 println!("❌ Peer disconnected: {}", addr);
             }
         }
-        
+
         Ok(())
     }
 
@@ -3317,16 +3431,23 @@ impl P2PNode {
             P2PMessage::GetPeers => Some(self.peers.keys().copied().collect()),
             _ => None,
         };
-    
+
         let peer = match self.peers.get_mut(&addr) {
             Some(p) => p,
             None => return,
         };
-    
+
         match msg {
-            P2PMessage::Version { version: _, timestamp, height, best_hash, peer_id } => {
+            P2PMessage::Version {
+                version: _,
+                timestamp,
+                height,
+                best_hash,
+                peer_id,
+            } => {
                 let latency = (current_timestamp() - timestamp) as u64;
-                self.sync_manager.update_peer(peer_id, addr, height, best_hash, latency);
+                self.sync_manager
+                    .update_peer(peer_id, addr, height, best_hash, latency);
                 peer.update_state(height, best_hash);
                 let _ = peer.send_message(&P2PMessage::Verack);
             }
@@ -3335,7 +3456,10 @@ impl P2PNode {
                 let _ = peer.send_message(&P2PMessage::Pong(nonce));
             }
             P2PMessage::Pong(_) => {}
-            P2PMessage::GetBlocks { from_height, max_count } => {
+            P2PMessage::GetBlocks {
+                from_height,
+                max_count,
+            } => {
                 let mut node = self.node.write();
                 let mut blocks = Vec::new();
                 let end = from_height.saturating_add(max_count as u64);
@@ -3353,13 +3477,14 @@ impl P2PNode {
             // ✅ ИСПРАВЛЕННАЯ ОБРАБОТКА БЛОКОВ
             P2PMessage::Blocks(blocks) => {
                 let peer_id = peer.get_peer_id();
-                
+
                 // Проверяем блоки с изменяемой ссылкой на node
                 let verification_result = {
                     let mut node = self.node.write();
-                    self.sync_manager.verify_and_accept_blocks(&blocks, &mut node)
+                    self.sync_manager
+                        .verify_and_accept_blocks(&blocks, &mut node)
                 };
-                
+
                 match verification_result {
                     Ok(new_height) => {
                         // Обновляем состояние P2P
@@ -3369,11 +3494,15 @@ impl P2PNode {
                         if let Some(last) = blocks.last() {
                             self.local_best_hash = last.header.hash(&mut node.argon2);
                         }
-                        
+
                         // Уведомляем sync_manager
                         let _ = self.sync_manager.on_blocks_received(&blocks, &peer_id);
-                        
-                        println!("✅ Synced and stored {} blocks, new height: {}", blocks.len(), new_height);
+
+                        println!(
+                            "✅ Synced and stored {} blocks, new height: {}",
+                            blocks.len(),
+                            new_height
+                        );
                     }
                     Err(e) => {
                         eprintln!("❌ Failed to verify and store blocks: {}", e);
@@ -3382,12 +3511,128 @@ impl P2PNode {
                     }
                 }
             }
-            P2PMessage::Share(_share) => {}
-            P2PMessage::Block { .. } => {}
+            P2PMessage::Share(share) => {
+                // Принимаем share от другого майнера
+                let accepted = {
+                    let mut node = self.node.write();
+                    node.add_share(share.clone())
+                };
+
+                if accepted {
+                    // Пересылаем share другим пирам (кроме отправителя)
+                    let msg = P2PMessage::Share(share);
+                    for (peer_addr, peer) in self.peers.iter_mut() {
+                        if *peer_addr != addr && !peer.is_banned() {
+                            let _ = peer.send_message(&msg);
+                        }
+                    }
+                }
+            }
+            P2PMessage::Block {
+                header,
+                transactions,
+            } => {
+                let mut node = self.node.write();
+
+                // Принимаем только следующий по высоте блок
+                let expected_height = node.height + 1;
+                let prev_hash = node.last_hash();
+
+                if header.prev_hash != prev_hash {
+                    return;
+                }
+
+                // Проверяем PoW
+                let hash = header.hash(&mut node.argon2);
+                if !header.difficulty.is_met_by(&hash) {
+                    println!("⚠️ Received invalid block (PoW failed)");
+                    return;
+                }
+
+                let block = Block {
+                    header: header.clone(),
+                    transactions: transactions.clone(),
+                    signature: None,
+                    pubkey: None,
+                };
+
+                // Сохраняем блок
+                let new_height = expected_height;
+                if let Err(e) = node.storage.save_block(new_height, &block) {
+                    println!("❌ Failed to save received block: {}", e);
+                    return;
+                }
+
+                node.blocks.push(header.clone());
+                node.block_hashes.insert(hash, new_height);
+                node.timestamps.push(header.timestamp);
+                node.height = new_height;
+
+                node.update_utxo_set(&block);
+
+                // Собираем txid транзакций из блока
+                let mut txids_in_block = HashSet::new();
+                for tx in &block.transactions {
+                    if !tx.is_coinbase() {
+                        let txid = tx.txid(&mut node.argon2);
+                        txids_in_block.insert(txid);
+                        node.processed_txids.insert(txid);
+                    }
+                }
+
+                // Удаляем из мемпула транзакции, которые уже в блоке
+                node.mempool.retain(|tx| {
+                    // Здесь мы не трогаем argon2, просто проверяем по уже собранным txid
+                    let mut argon2 = Argon2Cache::new(10); // временный кэш
+                    let txid = tx.txid(&mut argon2);
+                    !txids_in_block.contains(&txid)
+                });
+
+                let _ = node.storage.save_state("height", &node.height);
+                let _ = node.storage.save_mempool(&node.mempool);
+
+                // Обновляем локальное состояние P2P
+                self.local_height = new_height;
+                self.local_best_hash = hash;
+
+                println!("📥 Received and accepted block #{}", new_height);
+
+                // Пересылаем блок дальше
+                let msg = P2PMessage::Block {
+                    header: header.clone(),
+                    transactions: block.transactions,
+                };
+
+                drop(node); // отпускаем lock
+
+                for (peer_addr, peer) in self.peers.iter_mut() {
+                    if *peer_addr != addr && !peer.is_banned() {
+                        let _ = peer.send_message(&msg);
+                    }
+                }
+            }
             P2PMessage::EpochCommit { .. } => {}
             P2PMessage::GetMempool => {}
             P2PMessage::Mempool(_txs) => {}
-            P2PMessage::Transaction(_tx) => {}
+            P2PMessage::Transaction(tx) => {
+                let accepted = {
+                    let mut node = self.node.write();
+                    match node.add_transaction_to_mempool(tx.clone()) {
+                        Ok(()) => true,
+                        Err(_) => false,
+                    }
+                };
+
+                if accepted {
+                    // Пересылаем транзакцию дальше
+                    let msg = P2PMessage::Transaction(tx);
+                    for (peer_addr, peer) in self.peers.iter_mut() {
+                        if *peer_addr != addr && !peer.is_banned() {
+                            let _ = peer.send_message(&msg);
+                        }
+                    }
+                }
+            }
             P2PMessage::GetPeers => {
                 if let Some(peers) = peers_for_response {
                     let _ = peer.send_message(&P2PMessage::Peers(peers));
@@ -3417,31 +3662,31 @@ impl P2PNode {
             }
         }
     }
-    
+
     fn broadcast(&mut self, msg: &P2PMessage) {
         let now = current_timestamp();
         self.peers.retain(|_, peer| !peer.is_stale(now));
-        
+
         for peer in self.peers.values_mut() {
             if !peer.is_banned() {
                 let _ = peer.send_message(msg);
             }
         }
     }
-    
+
     fn connect_to(&mut self, addr: SocketAddr) -> Result<(), std::io::Error> {
         if self.peers.contains_key(&addr) {
             return Ok(());
         }
-        
+
         if !self.ddos_protection.check_connection_limit(addr) {
             return Ok(());
         }
-        
+
         let stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
         stream.set_nonblocking(true)?;
         let mut peer = PeerConnection::new(stream, addr);
-        
+
         let version_msg = P2PMessage::Version {
             version: 1,
             timestamp: current_timestamp(),
@@ -3449,15 +3694,15 @@ impl P2PNode {
             best_hash: self.local_best_hash,
             peer_id: peer.get_peer_id(),
         };
-        
+
         let _ = peer.send_message(&version_msg);
-        
+
         self.peers.insert(addr, peer);
         self.known_peers.insert(addr);
-        
+
         Ok(())
     }
-    
+
     fn connect_to_bootnodes(&mut self) {
         let bootnodes = self.bootnodes.clone();
         for bootnode in bootnodes {
@@ -3466,37 +3711,37 @@ impl P2PNode {
             }
         }
     }
-    
+
     fn peer_count(&self) -> usize {
         self.peers.len()
     }
-    
+
     fn get_peers_info(&self) -> Vec<(SocketAddr, Option<Height>, f64)> {
         self.peers
             .iter()
             .map(|(addr, peer)| (*addr, peer.get_height(), peer.get_score()))
             .collect()
     }
-    
+
     fn best_peer_height(&self) -> Option<Height> {
         self.sync_manager.best_peer_height()
     }
-    
+
     fn sync_progress(&self) -> f64 {
         self.sync_manager.sync_progress()
     }
-    
+
     fn is_syncing(&self) -> bool {
         self.sync_manager.is_syncing()
     }
-    
+
     fn needs_sync(&self) -> bool {
         self.sync_manager.needs_sync()
     }
 }
 
 // ============================================================
-// SYNC MANAGER 
+// SYNC MANAGER
 // ============================================================
 
 #[derive(Debug, Clone)]
@@ -3544,7 +3789,8 @@ struct SyncManager {
     last_request_time: Timestamp,
     retry_count: HashMap<PeerId, u32>,
     sync_complete_height: Height,
-    send_message_callback: Option<Box<dyn FnMut(&PeerId, P2PMessage) -> Result<(), String> + Send + Sync>>,
+    send_message_callback:
+        Option<Box<dyn FnMut(&PeerId, P2PMessage) -> Result<(), String> + Send + Sync>>,
 }
 
 impl SyncManager {
@@ -3563,40 +3809,51 @@ impl SyncManager {
             send_message_callback: None,
         }
     }
-    
+
     fn set_chain(&mut self, chain: Vec<BlockHeader>, hashes: HashMap<Hash32, Height>) {
         self.local_chain = chain;
         self.local_hashes = hashes;
     }
-    
-    fn update_peer(&mut self, peer_id: PeerId, address: SocketAddr, height: Height, best_hash: Hash32, latency_ms: u64) {
+
+    fn update_peer(
+        &mut self,
+        peer_id: PeerId,
+        address: SocketAddr,
+        height: Height,
+        best_hash: Hash32,
+        latency_ms: u64,
+    ) {
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             peer.height = height;
             peer.best_hash = best_hash;
             peer.latency_ms = latency_ms;
             peer.last_sync_time = current_timestamp();
         } else {
-            self.peers.insert(peer_id, SyncPeer {
+            self.peers.insert(
                 peer_id,
-                address,
-                height,
-                best_hash,
-                latency_ms,
-                last_sync_time: current_timestamp(),
-                retries: 0,
-                banned: false,
-            });
+                SyncPeer {
+                    peer_id,
+                    address,
+                    height,
+                    best_hash,
+                    latency_ms,
+                    last_sync_time: current_timestamp(),
+                    retries: 0,
+                    banned: false,
+                },
+            );
         }
     }
-    
+
     fn remove_peer(&mut self, peer_id: &PeerId) {
         self.peers.remove(peer_id);
     }
-    
+
     fn best_peer(&self) -> Option<SyncPeer> {
         let current_height = self.local_chain.len() as Height;
-        
-        self.peers.values()
+
+        self.peers
+            .values()
             .filter(|p| !p.banned && p.height > current_height)
             .max_by(|a, b| {
                 let score_a = (a.height - current_height) as f64 / (a.latency_ms as f64 + 1.0);
@@ -3605,32 +3862,34 @@ impl SyncManager {
             })
             .cloned()
     }
-    
+
     fn needs_sync(&self) -> bool {
         let current_height = self.local_chain.len() as Height;
-        let best_peer_height = self.peers.values()
+        let best_peer_height = self
+            .peers
+            .values()
             .filter(|p| !p.banned)
             .map(|p| p.height)
             .max()
             .unwrap_or(current_height);
-        
+
         let now = current_timestamp();
         let sync_timeout = now - self.last_sync_attempt > SYNC_TIMEOUT_SECS;
-        
+
         best_peer_height > current_height && (self.active_session.is_none() || sync_timeout)
     }
-    
+
     fn start_sync(&mut self, peer: SyncPeer) -> bool {
         if self.sync_in_progress {
             return false;
         }
-        
+
         let current_height = self.local_chain.len() as Height;
-        
+
         if peer.height <= current_height {
             return false;
         }
-        
+
         self.active_session = Some(SyncSession {
             peer_id: peer.peer_id,
             from_height: current_height,
@@ -3641,39 +3900,42 @@ impl SyncManager {
             blocks_received: 0,
             status: SyncStatus::Requesting,
         });
-        
+
         self.sync_in_progress = true;
         self.last_sync_attempt = current_timestamp();
-        
-        println!("🔄 Starting sync from height {} to {} with peer {}...", 
-                 current_height, peer.height, peer.address);
-        
+
+        println!(
+            "🔄 Starting sync from height {} to {} with peer {}...",
+            current_height, peer.height, peer.address
+        );
+
         true
     }
-    
+
     fn on_blocks_received(&mut self, blocks: &[Block], peer_id: &PeerId) -> Result<Height, String> {
         if let Some(session) = self.active_session.as_mut() {
             if session.peer_id != *peer_id {
                 return Err("Wrong peer".to_string());
             }
-            
+
             if blocks.is_empty() {
                 session.status = SyncStatus::Completed;
                 self.sync_in_progress = false;
                 return Ok(session.current_height);
             }
-            
+
             session.blocks_received += blocks.len() as u32;
             session.last_activity = current_timestamp();
             session.status = SyncStatus::Receiving;
-            
+
             for block in blocks {
                 session.current_height += 1;
                 self.local_chain.push(block.header.clone());
                 let mut argon2 = Argon2Cache::new(100);
-                self.local_hashes.insert(block.header.hash(&mut argon2), session.current_height);
+                self.local_hashes
+                    .insert(block.header.hash(&mut argon2), session.current_height);
             }
-            
+
             if session.current_height >= session.target_height {
                 session.status = SyncStatus::Completed;
                 self.sync_in_progress = false;
@@ -3681,21 +3943,21 @@ impl SyncManager {
             } else {
                 session.status = SyncStatus::Requesting;
             }
-            
+
             return Ok(session.current_height);
         }
-        
+
         Err("No active sync session".to_string())
     }
-    
+
     fn check_timeouts(&mut self) -> Option<PeerId> {
         let now = current_timestamp();
-        
+
         if let Some(session) = self.active_session.as_mut() {
             if now - session.last_activity > SYNC_TIMEOUT_SECS {
                 println!("⚠️ Sync timeout with peer");
                 session.status = SyncStatus::Failed("Timeout".to_string());
-                
+
                 if let Some(peer) = self.peers.get_mut(&session.peer_id) {
                     peer.retries += 1;
                     if peer.retries >= 3 {
@@ -3703,22 +3965,23 @@ impl SyncManager {
                         println!("🚫 Peer {} banned due to sync failures", peer.address);
                     }
                 }
-                
+
                 self.sync_in_progress = false;
                 return Some(session.peer_id);
             }
         }
-        
+
         None
     }
-    
+
     fn best_peer_height(&self) -> Option<Height> {
-        self.peers.values()
+        self.peers
+            .values()
             .filter(|p| !p.banned)
             .map(|p| p.height)
             .max()
     }
-    
+
     fn sync_progress(&self) -> f64 {
         if let Some(session) = self.active_session.as_ref() {
             let total = session.target_height - session.from_height;
@@ -3736,23 +3999,28 @@ impl SyncManager {
             }
         })
     }
-    
+
     fn is_syncing(&self) -> bool {
         self.sync_in_progress
     }
-    
+
     fn current_height(&self) -> Height {
         self.local_chain.len() as Height
     }
-    
-    pub fn request_blocks(&mut self, peer_id: &PeerId, from: Height, to: Height) -> Result<(), String> {
+
+    pub fn request_blocks(
+        &mut self,
+        peer_id: &PeerId,
+        from: Height,
+        to: Height,
+    ) -> Result<(), String> {
         if let Some(peer) = self.peers.get_mut(peer_id) {
             if peer.banned {
                 return Err("Peer is banned".to_string());
             }
-            
+
             let max_count = (to - from).min(MAX_BLOCKS_PER_REQUEST as u64) as u32;
-            
+
             if let Some(callback) = &mut self.send_message_callback {
                 let msg = P2PMessage::GetBlocks {
                     from_height: from,
@@ -3760,144 +4028,165 @@ impl SyncManager {
                 };
                 callback(peer_id, msg)?;
             }
-            
-            println!("📤 Requested blocks {}..{} from peer {}", from, from + max_count as u64, peer.address);
+
+            println!(
+                "📤 Requested blocks {}..{} from peer {}",
+                from,
+                from + max_count as u64,
+                peer.address
+            );
             Ok(())
         } else {
             Err("Peer not found".to_string())
         }
     }
-    
+
     pub fn request_blocks_from_peer(
         &mut self,
         peer_id: &PeerId,
         from_height: Height,
     ) -> Result<(), String> {
-        let peer = self.peers.get(peer_id)
+        let peer = self
+            .peers
+            .get(peer_id)
             .ok_or_else(|| "Peer not found in sync manager".to_string())?;
-        
+
         if peer.banned {
             return Err("Peer is banned".to_string());
         }
-        
+
         let now = current_timestamp();
         if now - self.last_request_time < 5 && self.sync_in_progress {
             return Err("Too frequent requests".to_string());
         }
-        
+
         let max_height = peer.height;
         let to_height = (from_height + SYNC_BATCH_SIZE - 1).min(max_height);
         let count = (to_height - from_height + 1) as u32;
-        
+
         if count == 0 {
             return Err("No blocks to request".to_string());
         }
-        
+
         let retries = self.retry_count.entry(*peer_id).or_insert(0);
         if *retries >= SYNC_MAX_RETRIES {
             return Err("Peer has too many retries".to_string());
         }
-        
+
         if let Some(callback) = &mut self.send_message_callback {
             let msg = P2PMessage::GetBlocks {
                 from_height,
                 max_count: count,
             };
-            
+
             callback(peer_id, msg)?;
-            
+
             if let Some(session) = self.active_session.as_mut() {
                 session.status = SyncStatus::Receiving;
                 session.last_activity = now;
             }
-            
+
             self.last_request_time = now;
             self.last_sync_attempt = now;
-            
-            println!("📤 Requested {} blocks from height {} from peer {}", 
-                     count, from_height, peer.address);
-            
+
+            println!(
+                "📤 Requested {} blocks from height {} from peer {}",
+                count, from_height, peer.address
+            );
+
             Ok(())
         } else {
             Err("No send callback configured".to_string())
         }
     }
-    
+
     pub fn verify_and_accept_blocks(
         &mut self,
         blocks: &[Block],
-        node: &mut Node,  // ← Теперь передаём всю ноду
+        node: &mut Node, // ← Теперь передаём всю ноду
     ) -> Result<Height, String> {
         let mut new_height = self.current_height();
-        
+
         for (idx, block) in blocks.iter().enumerate() {
             let expected_height = new_height + 1;
-            
+
             let expected_prev = if expected_height == 1 {
                 [0; 32]
             } else {
-                let prev_block = node.storage.get_block(expected_height - 1)?
+                let prev_block = node
+                    .storage
+                    .get_block(expected_height - 1)?
                     .ok_or("Previous block not found")?;
                 prev_block.header.hash(&mut node.argon2)
             };
-            
+
             if block.header.prev_hash != expected_prev {
                 return Err(format!("Invalid prev_hash at height {}", expected_height));
             }
-            
+
             let block_hash = block.header.hash(&mut node.argon2);
             if !block.header.difficulty.is_met_by(&block_hash) {
-                return Err(format!("Block hash doesn't meet difficulty at height {}", expected_height));
+                return Err(format!(
+                    "Block hash doesn't meet difficulty at height {}",
+                    expected_height
+                ));
             }
-            
+
             let prev_timestamp = if expected_height > 1 {
-                let prev_block = node.storage.get_block(expected_height - 1)?
+                let prev_block = node
+                    .storage
+                    .get_block(expected_height - 1)?
                     .ok_or("Previous block not found")?;
                 Some(prev_block.header.timestamp)
             } else {
                 None
             };
-            
+
             if !block.header.validate_timestamp(prev_timestamp, None) {
                 return Err(format!("Invalid timestamp at height {}", expected_height));
             }
-            
+
             let computed_root = Self::compute_merkle_root(&block.transactions, &mut node.argon2);
             if block.header.merkle_root != computed_root {
                 return Err(format!("Invalid merkle root at height {}", expected_height));
             }
-            
+
             if let (Some(sig), Some(pubkey)) = (&block.signature, &block.pubkey) {
                 if !Wallet::verify_signature(pubkey, sig, &block_hash) {
-                    return Err(format!("Invalid block signature at height {}", expected_height));
+                    return Err(format!(
+                        "Invalid block signature at height {}",
+                        expected_height
+                    ));
                 }
             }
-            
+
             node.storage.save_block(expected_height, block)?;
             Self::update_utxo_set(&node.storage, block, &mut node.argon2)?;
-            
+
             self.local_chain.push(block.header.clone());
             self.local_hashes.insert(block_hash, expected_height);
-            
+
             new_height = expected_height;
-            
+
             if idx == blocks.len() - 1 {
-                println!("✅ Verified and accepted {} blocks, new height: {}", blocks.len(), new_height);
+                println!(
+                    "✅ Verified and accepted {} blocks, new height: {}",
+                    blocks.len(),
+                    new_height
+                );
             }
         }
-        
+
         Ok(new_height)
     }
-    
+
     pub fn compute_merkle_root(txs: &[Transaction], argon2: &mut Argon2Cache) -> Hash32 {
         if txs.is_empty() {
             return [0; 32];
         }
-        
-        let mut hashes: Vec<Hash32> = txs.iter()
-            .map(|tx| tx.txid(argon2))
-            .collect();
-        
+
+        let mut hashes: Vec<Hash32> = txs.iter().map(|tx| tx.txid(argon2)).collect();
+
         while hashes.len() > 1 {
             let mut next = Vec::new();
             for chunk in hashes.chunks(2) {
@@ -3917,7 +4206,7 @@ impl SyncManager {
         }
         hashes[0]
     }
-    
+
     fn update_utxo_set(
         storage: &ProductionStorage,
         block: &Block,
@@ -3925,12 +4214,12 @@ impl SyncManager {
     ) -> Result<(), String> {
         for tx in &block.transactions {
             let txid = tx.txid(argon2);
-            
+
             for (i, output) in tx.outputs.iter().enumerate() {
                 let outpoint = (txid, i as u32);
                 storage.save_utxo(&outpoint, output)?;
             }
-            
+
             for input in &tx.inputs {
                 if !input.is_coinbase() {
                     storage.delete_utxo(&input.outpoint())?;
@@ -3939,37 +4228,43 @@ impl SyncManager {
         }
         Ok(())
     }
-    
+
     pub fn select_best_peer(&self) -> Option<(PeerId, Height, u64)> {
         let current_height = self.current_height();
-        
-        self.peers.iter()
+
+        self.peers
+            .iter()
             .filter(|(_, p)| !p.banned && p.height > current_height)
             .map(|(id, p)| (*id, p.height, p.latency_ms))
             .min_by_key(|(_, _, latency)| *latency)
             .or_else(|| {
-                self.peers.iter()
+                self.peers
+                    .iter()
                     .filter(|(_, p)| !p.banned)
                     .map(|(id, p)| (*id, p.height, p.latency_ms))
                     .max_by_key(|(_, height, _)| *height)
             })
     }
-    
-    pub fn start_active_sync(&mut self, _storage: &ProductionStorage, _argon2: &mut Argon2Cache) -> Result<bool, String> {
+
+    pub fn start_active_sync(
+        &mut self,
+        _storage: &ProductionStorage,
+        _argon2: &mut Argon2Cache,
+    ) -> Result<bool, String> {
         if self.sync_in_progress {
             return Ok(false);
         }
-        
+
         let current_height = self.current_height();
-        
+
         if let Some((peer_id, peer_height, _)) = self.select_best_peer() {
             if peer_height <= current_height {
                 return Ok(false);
             }
-            
+
             let from = current_height + 1;
             let to = peer_height.min(current_height + MAX_BLOCKS_PER_REQUEST as u64);
-            
+
             self.active_session = Some(SyncSession {
                 peer_id,
                 from_height: from,
@@ -3980,20 +4275,23 @@ impl SyncManager {
                 blocks_received: 0,
                 status: SyncStatus::Requesting,
             });
-            
+
             self.sync_in_progress = true;
             self.last_sync_attempt = current_timestamp();
-            
-            println!("🔄 Starting sync from height {} to {} via peer {:?}", from, to, peer_id);
-            
+
+            println!(
+                "🔄 Starting sync from height {} to {} via peer {:?}",
+                from, to, peer_id
+            );
+
             if let Some(_peer) = self.peers.get_mut(&peer_id) {
                 let max_count = (to - from + 1) as u32;
                 println!("   Would request {} blocks from peer", max_count);
             }
-            
+
             return Ok(true);
         }
-        
+
         Ok(false)
     }
 }
@@ -4024,65 +4322,70 @@ fn calculate_poci(
     if miners.is_empty() {
         return Vec::new();
     }
-    
-    let shares_sqrt: Vec<f64> = miners.values()
-        .map(|m| (m.shares as f64).sqrt())
-        .collect();
-    let max_shares_sqrt = shares_sqrt.iter().fold(0.0f64, |a, &b| a.max(b)).max(1.0f64);
-    
-    let max_loyalty = miners.values()
+
+    let shares_sqrt: Vec<f64> = miners.values().map(|m| (m.shares as f64).sqrt()).collect();
+    let max_shares_sqrt = shares_sqrt
+        .iter()
+        .fold(0.0f64, |a, &b| a.max(b))
+        .max(1.0f64);
+
+    let max_loyalty = miners
+        .values()
         .map(|m| loyalty.get(&m.miner_id).map(|l| l.value).unwrap_or(0.0))
         .fold(0.0f64, |a, b| a.max(b))
         .max(1.0f64);
-    
-    let bond_sqrt: Vec<f64> = miners.values()
+
+    let bond_sqrt: Vec<f64> = miners
+        .values()
         .filter(|m| {
-            bonds.get(&m.miner_id)
+            bonds
+                .get(&m.miner_id)
                 .map(|b| b.is_active(current_height) && b.amount >= MINIMUM_BOND_LYT)
                 .unwrap_or(false)
         })
         .map(|m| (m.bond as f64).sqrt())
         .collect();
     let max_bond_sqrt = bond_sqrt.iter().fold(0.0f64, |a, &b| a.max(b)).max(1.0f64);
-    
+
     let mut results = Vec::new();
     let mut total_poci = 0.0;
-    
+
     for (miner_id, data) in miners {
         let bond_data = bonds.get(miner_id);
         let is_bond_valid = bond_data
             .map(|b| b.is_active(current_height) && b.amount >= MINIMUM_BOND_LYT)
             .unwrap_or(false);
-        
+
         let share_contrib = if data.shares > 0 {
             POCI_WEIGHT_SHARES * ((data.shares as f64).sqrt() / max_shares_sqrt)
         } else {
             0.0
         };
-        
+
         let loyalty_val = loyalty.get(miner_id).map(|l| l.value).unwrap_or(0.0);
         let loyalty_contrib = POCI_WEIGHT_LOYALTY * (loyalty_val / max_loyalty);
-        
+
         let bond_contrib = if is_bond_valid && max_bond_sqrt > 0.0 {
             POCI_WEIGHT_BOND * ((data.bond as f64).sqrt() / max_bond_sqrt)
         } else {
             0.0
         };
-        
+
         let poci = share_contrib + loyalty_contrib + bond_contrib;
         total_poci += poci;
-        
+
         results.push((*miner_id, poci, data.shares, loyalty_val, data.bond));
     }
-    
-    results.into_iter()
+
+    results
+        .into_iter()
         .map(|(miner_id, poci, shares, loyalty, bond)| {
             let reward = if total_poci > 0.0 {
                 ((poci / total_poci) * EPOCH_REWARD_LYT as f64) as u64
             } else {
                 0
             };
-            
+
             PoCIResult {
                 miner_id,
                 poci,
@@ -4121,34 +4424,34 @@ fn adjust_difficulty(timestamps: &[Timestamp], current_target: &Target) -> Targe
     if timestamps.len() < DIFFICULTY_ADJUSTMENT_INTERVAL as usize + 1 {
         return *current_target;
     }
-    
+
     let start_idx = timestamps.len() - DIFFICULTY_ADJUSTMENT_INTERVAL as usize - 1;
     let start = timestamps[start_idx];
     let end = *timestamps.last().unwrap();
     let actual_time = end - start;
-    
+
     // Защита от деления на ноль
     if actual_time == 0 {
         return *current_target;
     }
-    
+
     // ✅ ПРАВИЛЬНЫЙ РАСЧЁТ: ожидаемое время / фактическое время
-    let expected_time = DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME;  // 120 * 60 = 7200
-    let factor = (expected_time as f64 / actual_time as f64)  // ✅ ИСПРАВЛЕНО!
+    let expected_time = DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME; // 120 * 60 = 7200
+    let factor = (expected_time as f64 / actual_time as f64) // ✅ ИСПРАВЛЕНО!
         .clamp(1.0 - MAX_DIFFICULTY_CHANGE, 1.0 + MAX_DIFFICULTY_CHANGE);
-    
+
     let adjusted = current_target.adjust(factor);
-    
+
     // Защита от слишком низкой/высокой сложности
     let min_difficulty = Target::genesis();
     let max_difficulty = min_difficulty.adjust(0.001);
-    
+
     if adjusted.to_difficulty() < min_difficulty.to_difficulty() {
         return min_difficulty;
     } else if adjusted.to_difficulty() > max_difficulty.to_difficulty() {
         return max_difficulty;
     }
-    
+
     adjusted
 }
 
@@ -4157,9 +4460,8 @@ fn adjust_difficulty(timestamps: &[Timestamp], current_target: &Target) -> Targe
 // ============================================================
 
 const GENESIS_OUTPUT_SCRIPT: [u8; 25] = [
-    0x76, 0xa9, 0x14, 0x62, 0xe9, 0x07, 0xb1, 0x5c,
-    0xbf, 0x27, 0xd5, 0x42, 0x53, 0x99, 0xeb, 0xf6,
-    0xf0, 0xfb, 0x50, 0xeb, 0xb8, 0x8f, 0x18, 0x88, 0xac
+    0x76, 0xa9, 0x14, 0x62, 0xe9, 0x07, 0xb1, 0x5c, 0xbf, 0x27, 0xd5, 0x42, 0x53, 0x99, 0xeb, 0xf6,
+    0xf0, 0xfb, 0x50, 0xeb, 0xb8, 0x8f, 0x18, 0x88, 0xac,
 ];
 
 fn create_genesis_block() -> (BlockHeader, Transaction) {
@@ -4168,11 +4470,11 @@ fn create_genesis_block() -> (BlockHeader, Transaction) {
         prev_hash: [0; 32],
         merkle_root: [0; 32],
         timestamp: GENESIS_TIMESTAMP,
-        difficulty: Target([0xFF; 32]),  // ← РАБОТАЕТ!
+        difficulty: Target([0xFF; 32]), // ← РАБОТАЕТ!
         nonce: 0,
         epoch_index: 1,
     };
-    
+
     let coinbase = Transaction {
         version: 1,
         inputs: vec![TxIn::coinbase()],
@@ -4182,7 +4484,7 @@ fn create_genesis_block() -> (BlockHeader, Transaction) {
         }],
         locktime: 0,
     };
-    
+
     (header, coinbase)
 }
 
@@ -4199,19 +4501,19 @@ impl RpcServer {
     fn new(node: Arc<RwLock<Node>>, port: u16) -> Self {
         Self { node, port }
     }
-    
+
     async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let node_info = self.node.clone();
         let node_block = self.node.clone();
         let node_send = self.node.clone();
         let node_peers = self.node.clone();
         let node_miners = self.node.clone();
-        
+
         let cors = warp::cors()
             .allow_any_origin()
             .allow_methods(vec!["GET", "POST"])
             .allow_headers(vec!["Content-Type"]);
-        
+
         let info_node = node_info.clone();
         let info = warp::path("info").and(warp::get()).map(move || {
             let node = info_node.read();
@@ -4222,7 +4524,7 @@ impl RpcServer {
             } else {
                 0
             };
-            
+
             warp::reply::json(&serde_json::json!({
                 "height": node.height,
                 "epoch": node.epoch,
@@ -4240,7 +4542,7 @@ impl RpcServer {
                 "argon2_avg_ms": avg_time,
             }))
         });
-        
+
         let block_node = node_block.clone();
         let block = warp::path("block")
             .and(warp::path::param::<u64>())
@@ -4268,9 +4570,9 @@ impl RpcServer {
                     )
                 }
             });
-            
-            let send_node = node_send.clone();
-let send_tx = warp::path("transaction")
+
+        let send_node = node_send.clone();
+        let send_tx = warp::path("transaction")
     .and(warp::post())
     .and(warp::body::json())
     .and_then(move |tx_hex: String| {
@@ -4327,61 +4629,68 @@ let send_tx = warp::path("transaction")
             }
         }
     });
-        
-        
+
         let peers_node = node_peers.clone();
         let peers = warp::path("peers").and(warp::get()).map(move || {
             let node = peers_node.read();
-            let peers_info: Vec<_> = node.p2p.as_ref()
-    .map(|p| p.get_peers_info())
-    .unwrap_or_default();
+            let peers_info: Vec<_> = node
+                .p2p
+                .as_ref()
+                .map(|p| p.get_peers_info())
+                .unwrap_or_default();
             warp::reply::json(&serde_json::json!({
                 "peers": peers_info,
                 "total": peers_info.len(),
             }))
         });
-        
+
         let miners_node = node_miners.clone();
         let miners = warp::path("miners").and(warp::get()).map(move || {
             let node = miners_node.read();
-            let miners_list: Vec<_> = node.miners.iter()
-                .map(|(id, data)| serde_json::json!({
-                    "miner_id": hex::encode(id),
-                    "shares": data.shares,
-                    "bond": data.bond,
-                    "loyalty": data.loyalty,
-                    "blocks_found": data.blocks_found,
-                    "invalid_ratio": data.invalid_ratio,
-                    "last_share": data.last_share_time,
-                }))
+            let miners_list: Vec<_> = node
+                .miners
+                .iter()
+                .map(|(id, data)| {
+                    serde_json::json!({
+                        "miner_id": hex::encode(id),
+                        "shares": data.shares,
+                        "bond": data.bond,
+                        "loyalty": data.loyalty,
+                        "blocks_found": data.blocks_found,
+                        "invalid_ratio": data.invalid_ratio,
+                        "last_share": data.last_share_time,
+                    })
+                })
                 .collect();
-            
+
             warp::reply::json(&serde_json::json!({
                 "miners": miners_list,
                 "total": miners_list.len(),
             }))
         });
-        
+
         let mempool_node = self.node.clone();
         let mempool = warp::path("mempool").and(warp::get()).map(move || {
-        let node = mempool_node.read();
-        let txs: Vec<_> = node.mempool.iter()
-        .map(|tx: &Transaction| {
-            let mut argon2 = Argon2Cache::new(100);
-            serde_json::json!({
-                "txid": hex::encode(tx.txid(&mut argon2)),
-                "size": tx.serialize().len(),
-                "fee": tx.fee(&node.storage).unwrap_or(0),
-            })
-        })
-        .collect();
-    
-    warp::reply::json(&serde_json::json!({
-        "transactions": txs,
-        "total": txs.len(),
-    }))
-});
-        
+            let node = mempool_node.read();
+            let txs: Vec<_> = node
+                .mempool
+                .iter()
+                .map(|tx: &Transaction| {
+                    let mut argon2 = Argon2Cache::new(100);
+                    serde_json::json!({
+                        "txid": hex::encode(tx.txid(&mut argon2)),
+                        "size": tx.serialize().len(),
+                        "fee": tx.fee(&node.storage).unwrap_or(0),
+                    })
+                })
+                .collect();
+
+            warp::reply::json(&serde_json::json!({
+                "transactions": txs,
+                "total": txs.len(),
+            }))
+        });
+
         let health_node = node_info.clone();
         let health = warp::path("health").and(warp::get()).map(move || {
             let node = health_node.read();
@@ -4393,7 +4702,7 @@ let send_tx = warp::path("transaction")
                 "sync_progress": node.sync_progress(),
             }))
         });
-        
+
         let routes = info
             .or(block)
             .or(send_tx)
@@ -4402,7 +4711,7 @@ let send_tx = warp::path("transaction")
             .or(mempool)
             .or(health)
             .with(cors);
-        
+
         println!("📡 RPC endpoints on port {}:", self.port);
         println!("   GET  /info       - node information");
         println!("   GET  /block/{{height}} - get block");
@@ -4411,9 +4720,9 @@ let send_tx = warp::path("transaction")
         println!("   GET  /miners     - list active miners");
         println!("   GET  /mempool    - list pending transactions");
         println!("   GET  /health     - health check");
-        
+
         warp::serve(routes).run(([0, 0, 0, 0], self.port)).await;
-        
+
         Ok(())
     }
 }
@@ -4435,7 +4744,7 @@ struct Node {
     loyalty: HashMap<MinerId, LoyaltyData>,
     share_pool: SharePool,
     argon2: Argon2Cache,
-    p2p: Option<P2PNode>,   
+    p2p: Option<P2PNode>,
     blocks_found: u64,
     shares_found: u64,
     start_time: Timestamp,
@@ -4458,20 +4767,20 @@ impl Node {
         let network = "mainnet";
         let storage = ProductionStorage::new(network)?;
         println!("🔧 [2] Storage created");
-        
+
         println!("🔧 [3] Getting height...");
         let height = storage.get_height()?;
         println!("🔧 [4] Height: {}", height);
-        
+
         println!("🔧 [5] Getting epoch...");
         let epoch = storage.get_state::<u32>("epoch")?.unwrap_or(1);
         println!("🔧 [6] Epoch: {}", epoch);
-        
+
         println!("🔧 [7] Loading wallet...");
         let wallet = Self::load_or_create_wallet(&storage)?;
         let miner_id = wallet.miner_id;
         println!("🔧 [8] Wallet loaded: {}", wallet.address);
-        
+
         println!("🔧 [9] Creating node struct...");
         let mut node = Self {
             height,
@@ -4503,7 +4812,7 @@ impl Node {
             sync_manager: SyncManager::new(),
         };
         println!("🔧 [10] Node struct created");
-        
+
         println!("🔧 [11] Loading state...");
         if height == 0 {
             println!("🔧 [12] Initializing genesis...");
@@ -4515,129 +4824,134 @@ impl Node {
             node.verify_genesis_signature();
         }
         println!("🔧 [14] State loaded");
-        
+
         println!("🔧 [15] Loading checkpoints...");
         node.load_checkpoints()?;
         println!("🔧 [16] Checkpoints loaded");
-        
+
         println!("🔧 [17] Creating node_arc...");
         let node_arc = Arc::new(RwLock::new(node));
         println!("🔧 [18] Node_arc created");
-        
+
         println!("🔧 [19] Creating P2P...");
         let mut p2p = P2PNode::new(
             config.network.port,
             config.network.bootnodes.clone(),
-            node_arc.clone()
-        ).map_err(|e| e.to_string())?;
+            node_arc.clone(),
+        )
+        .map_err(|e| e.to_string())?;
         println!("🔧 [20] P2P created");
-        
+
         // Настраиваем callback для отправки сообщений через P2P
         {
             let node_ref = node_arc.clone();
-            p2p.sync_manager.send_message_callback = Some(Box::new(move |peer_id: &PeerId, msg: P2PMessage| {
-                let mut node = node_ref.write();
-                if let Some(p2p) = node.p2p.as_mut() {
-                    for peer in p2p.peers.values_mut() {
-                        if &peer.peer_id == peer_id {
-                            return peer.send_message(&msg).map_err(|e| e.to_string());
+            p2p.sync_manager.send_message_callback =
+                Some(Box::new(move |peer_id: &PeerId, msg: P2PMessage| {
+                    let mut node = node_ref.write();
+                    if let Some(p2p) = node.p2p.as_mut() {
+                        for peer in p2p.peers.values_mut() {
+                            if &peer.peer_id == peer_id {
+                                return peer.send_message(&msg).map_err(|e| e.to_string());
+                            }
                         }
                     }
-                }
-                Err("Peer not found".to_string())
-            }));
+                    Err("Peer not found".to_string())
+                }));
         }
-        
+
         // Сохраняем P2P в ноду и инициализируем состояние
         {
             let mut node = node_arc.write();
             let height = node.height;
             let best_hash = node.last_hash();
-            
+
             node.p2p = Some(p2p);
-            
+
             if let Some(p2p) = &mut node.p2p {
                 p2p.set_local_state(height, best_hash);
                 p2p.connect_to_bootnodes();
             }
         }
-        
+
         println!("🔧 [21] Node creation complete!");
         Ok(node_arc)
     }
-
-
 
     fn load_or_create_wallet(storage: &ProductionStorage) -> Result<Wallet, String> {
         let wallet_path = dirs::home_dir()
             .ok_or("Cannot find home dir")?
             .join(".accum")
             .join("wallet.json");
-        
+
         // 1. Пытаемся загрузить из файла
         if wallet_path.exists() {
             println!("🔑 Loading wallet from {}", wallet_path.display());
             let content = fs::read_to_string(&wallet_path)
                 .map_err(|e| format!("Failed to read wallet: {}", e))?;
-            
+
             #[derive(serde::Deserialize)]
             struct WalletFile {
                 private_key: String,
             }
-            
+
             let wallet_data: WalletFile = serde_json::from_str(&content)
                 .map_err(|e| format!("Invalid wallet file: {}", e))?;
-            
-            let secret_key = hex::decode(&wallet_data.private_key)
-                .map_err(|_| "Invalid private key format")?;
-            
+
+            let secret_key =
+                hex::decode(&wallet_data.private_key).map_err(|_| "Invalid private key format")?;
+
             let wallet = Wallet::from_secret_key(&secret_key)?;
             println!("✅ Wallet loaded: {}", wallet.address);
             return Ok(wallet);
         }
-        
+
         // 2. Пытаемся загрузить из базы
         if let Some(wallet_data) = storage.get_state::<Vec<u8>>("wallet")? {
             println!("🔑 Loading wallet from database...");
-            let secret_key: [u8; 32] = wallet_data.try_into()
-                .map_err(|_| "Invalid wallet data")?;
+            let secret_key: [u8; 32] = wallet_data.try_into().map_err(|_| "Invalid wallet data")?;
             let wallet = Wallet::from_secret_key(&secret_key)?;
-            
+
             // Сохраняем в файл для будущих запусков
             let wallet_json = serde_json::json!({
                 "private_key": hex::encode(&wallet.secret_key),
             });
             fs::create_dir_all(wallet_path.parent().unwrap())
                 .map_err(|e| format!("Failed to create .accum directory: {}", e))?;
-            fs::write(&wallet_path, serde_json::to_string_pretty(&wallet_json).unwrap())
-                .map_err(|e| format!("Failed to save wallet: {}", e))?;
+            fs::write(
+                &wallet_path,
+                serde_json::to_string_pretty(&wallet_json).unwrap(),
+            )
+            .map_err(|e| format!("Failed to save wallet: {}", e))?;
             println!("✅ Wallet saved to {}", wallet_path.display());
-            
+
             return Ok(wallet);
         }
-        
+
         // 3. Создаем новый кошелек
         println!("🆕 No wallet found, creating new wallet...");
         let wallet = Wallet::generate()?;
-        
+
         // Сохраняем в файл
         let wallet_json = serde_json::json!({
             "private_key": hex::encode(&wallet.secret_key),
         });
         fs::create_dir_all(wallet_path.parent().unwrap())
             .map_err(|e| format!("Failed to create .accum directory: {}", e))?;
-        fs::write(&wallet_path, serde_json::to_string_pretty(&wallet_json).unwrap())
-            .map_err(|e| format!("Failed to save wallet: {}", e))?;
-        
+        fs::write(
+            &wallet_path,
+            serde_json::to_string_pretty(&wallet_json).unwrap(),
+        )
+        .map_err(|e| format!("Failed to save wallet: {}", e))?;
+
         // Сохраняем в базу
         let _ = storage.save_state("wallet", &wallet.secret_key.to_vec());
-        
+
         println!("✅ New wallet created!");
         println!("📫 Address: {}", wallet.address);
         println!("🆔 Miner ID: {}", hex::encode(&wallet.miner_id));
         println!("📜 Private Key: {}", hex::encode(&wallet.secret_key));
         println!("⚠️  BACKUP YOUR WALLET FILE: ~/.accum/wallet.json");
-        
+
         Ok(wallet)
     }
     fn load_state(&mut self) -> Result<(), String> {
@@ -4645,8 +4959,12 @@ impl Node {
         let total_blocks = self.height + 1;
         for h in 0..=self.height {
             if h % 10 == 0 || h == self.height {
-                println!("   ⏳ Loading block {}/{} ({:.1}%)", 
-                         h, self.height, (h as f64 / self.height as f64) * 100.0);
+                println!(
+                    "   ⏳ Loading block {}/{} ({:.1}%)",
+                    h,
+                    self.height,
+                    (h as f64 / self.height as f64) * 100.0
+                );
             }
             if let Some(block) = self.storage.get_block(h)? {
                 let hash = block.header.hash(&mut self.argon2);
@@ -4657,13 +4975,13 @@ impl Node {
             }
         }
         println!("   ✅ Blocks loaded: {}", self.blocks.len());
-        
+
         println!("📂 Loading miners...");
         let mut miner_count = 0;
-        let mut iter = self.storage.db.iterator_cf(
-            self.storage.cf_handle(CF_MINERS), 
-            IteratorMode::Start
-        );
+        let mut iter = self
+            .storage
+            .db
+            .iterator_cf(self.storage.cf_handle(CF_MINERS), IteratorMode::Start);
         while let Some(Ok((_key, value))) = iter.next() {
             if let Ok(miner) = bincode::deserialize::<MinerData>(&value) {
                 self.miners.insert(miner.miner_id, miner);
@@ -4671,13 +4989,13 @@ impl Node {
             }
         }
         println!("   ✅ Miners loaded: {}", miner_count);
-        
+
         println!("📂 Loading bonds...");
         let mut bond_count = 0;
-        let mut iter = self.storage.db.iterator_cf(
-            self.storage.cf_handle(CF_BONDS), 
-            IteratorMode::Start
-        );
+        let mut iter = self
+            .storage
+            .db
+            .iterator_cf(self.storage.cf_handle(CF_BONDS), IteratorMode::Start);
         while let Some(Ok((_key, value))) = iter.next() {
             if let Ok(bond) = bincode::deserialize::<Bond>(&value) {
                 self.bonds.insert(bond.miner_id, bond);
@@ -4685,13 +5003,13 @@ impl Node {
             }
         }
         println!("   ✅ Bonds loaded: {}", bond_count);
-        
+
         println!("📂 Loading loyalty...");
         let mut loyalty_count = 0;
-        let mut iter = self.storage.db.iterator_cf(
-            self.storage.cf_handle(CF_STATE), 
-            IteratorMode::Start
-        );
+        let mut iter = self
+            .storage
+            .db
+            .iterator_cf(self.storage.cf_handle(CF_STATE), IteratorMode::Start);
         while let Some(Ok((key, value))) = iter.next() {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with("loyalty_") {
@@ -4708,80 +5026,94 @@ impl Node {
             }
         }
         println!("   ✅ Loyalty loaded: {}", loyalty_count);
-        
+
         println!("📂 Loading mempool...");
         self.mempool = self.storage.load_mempool()?;
         println!("   ✅ Mempool loaded: {}", self.mempool.len());
-        
+
         println!("💾 ✅ State loaded successfully!");
-        println!("   Height: {}, Miners: {}, Bonds: {}, Loyalty: {}", 
-                 self.height, self.miners.len(), self.bonds.len(), self.loyalty.len());
+        println!(
+            "   Height: {}, Miners: {}, Bonds: {}, Loyalty: {}",
+            self.height,
+            self.miners.len(),
+            self.bonds.len(),
+            self.loyalty.len()
+        );
         Ok(())
     }
-    
+
     fn load_checkpoints(&mut self) -> Result<(), String> {
-        let mut iter = self.storage.db.iterator_cf(
-            self.storage.cf_handle(CF_CHECKPOINTS), 
-            IteratorMode::Start
-        );
+        let mut iter = self
+            .storage
+            .db
+            .iterator_cf(self.storage.cf_handle(CF_CHECKPOINTS), IteratorMode::Start);
         while let Some(Ok((_key, value))) = iter.next() {
             if let Ok(checkpoint) = bincode::deserialize::<Checkpoint>(&value) {
                 self.checkpoints.push(checkpoint);
             }
         }
-        
+
         if let Some(last) = self.checkpoints.last() {
-            println!("📌 Loaded {} checkpoints, latest at height {}", 
-                     self.checkpoints.len(), last.height);
+            println!(
+                "📌 Loaded {} checkpoints, latest at height {}",
+                self.checkpoints.len(),
+                last.height
+            );
         }
         Ok(())
     }
-    
+
     fn init_genesis(&mut self) {
         let (header, coinbase) = create_genesis_block();
         let txid = coinbase.txid(&mut self.argon2);
-        
+
         let mut header = header;
         header.merkle_root = txid;
-        
+
         let outpoint = (txid, 0);
         let _ = self.storage.save_utxo(&outpoint, &coinbase.outputs[0]);
-        
+
         let hash = header.hash(&mut self.argon2);
-        
+
         let (signature, pubkey) = if let Some(wallet) = &self.wallet {
-            (wallet.sign_block(&hash).ok(), Some(wallet.public_key.clone()))
+            (
+                wallet.sign_block(&hash).ok(),
+                Some(wallet.public_key.clone()),
+            )
         } else {
             (None, None)
         };
-        
+
         let block = Block {
             header: header.clone(),
             transactions: vec![coinbase],
             signature: signature.clone(),
             pubkey,
         };
-        
+
         self.blocks.push(header.clone());
         self.block_hashes.insert(hash, 0);
         self.timestamps.push(GENESIS_TIMESTAMP);
-        
+
         let _ = self.storage.save_block(0, &block);
         let _ = self.storage.save_state("height", &0u64);
         let _ = self.storage.save_state("epoch", &1u32);
-        
+
         println!("✅ Genesis block created");
         println!("   Hash: {}...", hex::encode(&hash[0..8]));
         if signature.is_some() {
-            println!("   Signature: {}...", hex::encode(&signature.unwrap()[0..8]));
+            println!(
+                "   Signature: {}...",
+                hex::encode(&signature.unwrap()[0..8])
+            );
         }
         println!("   Height: 0\n");
     }
-    
+
     fn verify_genesis_signature(&self) -> bool {
         // ✅ ACCUM v3.2+ - Genesis block does not require signature
         // The genesis block is the root of trust by definition
-        
+
         match self.storage.get_block(0) {
             Ok(Some(_block)) => {
                 println!("✅ Genesis block verified (ACCUM v3.2+ spec)");
@@ -4798,11 +5130,11 @@ impl Node {
             }
         }
     }
-    
+
     fn last_block(&self) -> Option<&BlockHeader> {
         self.blocks.last()
     }
-    
+
     fn last_hash(&mut self) -> Hash32 {
         if let Some(last) = self.last_block() {
             let header = last.clone();
@@ -4811,11 +5143,14 @@ impl Node {
             [0; 32]
         }
     }
-    
+
     fn last_difficulty(&self) -> Target {
         // Пересчёт на блоках 120, 240, 360, ...
-        if self.height >= DIFFICULTY_ADJUSTMENT_INTERVAL && self.height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 {
-            let current_target = self.last_block()
+        if self.height >= DIFFICULTY_ADJUSTMENT_INTERVAL
+            && self.height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0
+        {
+            let current_target = self
+                .last_block()
                 .map(|b| b.difficulty)
                 .unwrap_or_else(Target::genesis);
 
@@ -4830,23 +5165,27 @@ impl Node {
             .map(|b| b.difficulty)
             .unwrap_or_else(Target::genesis)
     }
-    
+
     fn sync_progress(&self) -> f64 {
-        let best_peer = self.p2p.as_ref()
-    .and_then(|p| p.best_peer_height())
-    .unwrap_or(self.height);
+        let best_peer = self
+            .p2p
+            .as_ref()
+            .and_then(|p| p.best_peer_height())
+            .unwrap_or(self.height);
         if best_peer == 0 {
             return 1.0;
         }
         self.height as f64 / best_peer as f64
     }
-    
+
     fn median_timestamp(&self) -> Option<Timestamp> {
         if self.timestamps.len() < 11 {
             return None;
         }
-        
-        let mut last = self.timestamps.iter()
+
+        let mut last = self
+            .timestamps
+            .iter()
             .rev()
             .take(11)
             .cloned()
@@ -4854,48 +5193,54 @@ impl Node {
         last.sort();
         Some(last[5])
     }
-    
+
     fn add_bond(&mut self, miner_id: MinerId, amount: u64) {
         if amount < MINIMUM_BOND_LYT {
-            println!("⚠️ Bond below minimum: {} LYT (min: {} LYT)", amount, MINIMUM_BOND_LYT);
+            println!(
+                "⚠️ Bond below minimum: {} LYT (min: {} LYT)",
+                amount, MINIMUM_BOND_LYT
+            );
             return;
         }
-        
+
         let bond = Bond::new(amount, self.height, miner_id);
         self.bonds.insert(miner_id, bond.clone());
         let _ = self.storage.save_bond(&miner_id, &bond);
-        
+
         if let Some(miner) = self.miners.get_mut(&miner_id) {
             miner.bond = amount;
         }
-        
-        println!("💰 Bond added for {}...: {} LYT", 
-                 hex::encode(&miner_id[0..8]), amount);
+
+        println!(
+            "💰 Bond added for {}...: {} LYT",
+            hex::encode(&miner_id[0..8]),
+            amount
+        );
     }
-    
+
     fn add_share(&mut self, share: Share) -> bool {
         let miner_id = share.miner_id;
         let now = share.timestamp;
         let current_epoch = self.epoch;
-        
+
         if let Some(miner) = self.miners.get(&miner_id) {
             if miner.is_banned(now) {
                 return false;
             }
         }
-        
-        let bond_active = self.bonds.get(&miner_id)
+
+        let bond_active = self
+            .bonds
+            .get(&miner_id)
             .map(|b| b.is_active(self.height))
             .unwrap_or(false);
-        
+
         if !bond_active {
             return false;
         }
-        
-        let bond_amount = self.bonds.get(&miner_id)
-            .map(|b| b.amount)
-            .unwrap_or(0);
-        
+
+        let bond_amount = self.bonds.get(&miner_id).map(|b| b.amount).unwrap_or(0);
+
         let target_share = self.last_difficulty().share_target();
         let expected_prev = self.last_hash();
         let is_valid = match share.validate(
@@ -4911,27 +5256,29 @@ impl Node {
                 false
             }
         };
-        
+
         match self.share_pool.add_share(share.clone(), is_valid) {
             Ok(true) => {
-                let miner = self.miners
+                let miner = self
+                    .miners
                     .entry(miner_id)
                     .or_insert_with(|| MinerData::new(miner_id, bond_amount, current_epoch, now));
-                
+
                 miner.add_share(now);
-                
-                let loyalty = self.loyalty
+
+                let loyalty = self
+                    .loyalty
                     .entry(miner_id)
                     .or_insert_with(LoyaltyData::new);
                 loyalty.update(current_epoch, true);
-                
+
                 self.shares_found += 1;
-                
+
                 if self.shares_found % 100 == 0 {
                     print!(".");
                     let _ = std::io::stdout().flush();
                 }
-                
+
                 true
             }
             Ok(false) => false,
@@ -4944,7 +5291,7 @@ impl Node {
             }
         }
     }
-    
+
     fn sort_mempool_by_fee(&mut self) {
         self.mempool.sort_by(|a, b| {
             let fee_a = a.fee(&self.storage).unwrap_or(0);
@@ -4952,28 +5299,30 @@ impl Node {
             fee_b.cmp(&fee_a)
         });
     }
-    
+
     fn add_transaction_to_mempool(&mut self, tx: Transaction) -> Result<(), String> {
         // 1. Базовая валидация
-        tx.validate_basic().map_err(|e| format!("Invalid transaction: {}", e))?;
-        
+        tx.validate_basic()
+            .map_err(|e| format!("Invalid transaction: {}", e))?;
+
         // 2. Проверяем валидацию с UTXO
-        tx.validate(&self.storage).map_err(|e| format!("Transaction validation failed: {}", e))?;
-        
+        tx.validate(&self.storage)
+            .map_err(|e| format!("Transaction validation failed: {}", e))?;
+
         let txid = tx.txid(&mut self.argon2);
-        
+
         // 3. Проверяем, не обработана ли уже эта транзакция
         if self.processed_txids.contains(&txid) {
             return Err("Transaction already processed".to_string());
         }
-        
+
         // 4. Проверяем, нет ли уже такой транзакции в мемпуле
         for existing_tx in &self.mempool {
             if existing_tx.txid(&mut self.argon2) == txid {
                 return Err("Transaction already in mempool".to_string());
             }
         }
-        
+
         // 5. Проверяем, что входы не используются в других транзакциях мемпула
         let mut used_inputs = HashSet::new();
         for existing_tx in &self.mempool {
@@ -4983,20 +5332,20 @@ impl Node {
                 }
             }
         }
-        
+
         for input in &tx.inputs {
             if !input.is_coinbase() && used_inputs.contains(&input.outpoint()) {
                 return Err("Input already used in mempool transaction".to_string());
             }
         }
-        
+
         // 6. Добавляем в мемпул
         self.mempool.push(tx);
         self.processed_txids.insert(txid);
-        
+
         // 7. Сортируем по fee
         self.sort_mempool_by_fee();
-        
+
         // 8. Ограничиваем размер мемпула
         while self.mempool.len() > self.config.advanced.max_mempool_size {
             if let Some(removed) = self.mempool.pop() {
@@ -5004,37 +5353,50 @@ impl Node {
                 self.processed_txids.remove(&removed_txid);
             }
         }
-        
+
         // 9. Сохраняем в базу
         let _ = self.storage.save_mempool(&self.mempool);
-        
-        println!("✅ Transaction added to mempool: {}", hex::encode(&txid[0..8]));
+
+        println!(
+            "✅ Transaction added to mempool: {}",
+            hex::encode(&txid[0..8])
+        );
         Ok(())
     }
-    
+
     fn run_with_graceful_shutdown(&mut self) -> Result<(), String> {
+        // ✅ Автоматически создаём bond для локального майнера, если его нет
+        if !self.bonds.contains_key(&self.miner_id) {
+            let bond_amount = self.config.mining.bond.max(MINIMUM_BOND_LYT);
+            self.add_bond(self.miner_id, bond_amount);
+            println!("💰 Auto-created bond: {} LYT", bond_amount);
+        }
+
         println!("\n🚀 Node starting...");
         println!("   Height: {}", self.height);
         println!("   Epoch: {}", self.epoch);
         // ✅ Получаем количество пиров через Option
         let peer_count = self.p2p.as_ref().map(|p| p.peer_count()).unwrap_or(0);
         println!("   Peers: {}", peer_count);
-        
+
         let mining_enabled = self.config.mining.enabled;
-        
+
         if mining_enabled {
-            println!("⛏️  Solo mining enabled with {} threads", self.config.mining.threads);
+            println!(
+                "⛏️  Solo mining enabled with {} threads",
+                self.config.mining.threads
+            );
         }
-        
+
         println!("\n🔄 Starting main loop...");
-        
+
         let mut last_stats_time = current_timestamp();
-        let mut last_sync_request_time = 0u64; // ← НОВОЕ: контроль частоты запросов
-        
+        let mut last_sync_request_time = 0u64;
+
         loop {
             if should_shutdown() {
                 println!("\n⏳ Shutting down...");
-                
+
                 if !is_saving_state() {
                     set_saving_state(true);
                     println!("💾 Saving state...");
@@ -5042,24 +5404,24 @@ impl Node {
                     let _ = self.storage.flush();
                     println!("✅ State saved");
                 }
-                
+
                 break;
             }
-            
+
             // 1. Обработка входящих P2P сообщений
             if let Some(p2p) = self.p2p.as_mut() {
                 if let Err(e) = p2p.process_messages() {
                     println!("⚠️ P2P error: {}", e);
                 }
             }
-            
+
             // 2. Приём новых соединений
             if let Some(p2p) = self.p2p.as_mut() {
                 if let Err(e) = p2p.accept_connections() {
                     println!("⚠️ Accept error: {}", e);
                 }
             }
-            
+
             // 3. Проверка необходимости синхронизации (старт сессии)
             if let Some(p2p) = self.p2p.as_mut() {
                 if p2p.needs_sync() {
@@ -5068,7 +5430,7 @@ impl Node {
                     }
                 }
             }
-            
+
             // 4. Проверка таймаутов синхронизации
             if let Some(p2p) = self.p2p.as_mut() {
                 if let Some(_peer_id) = p2p.sync_manager.check_timeouts() {
@@ -5078,57 +5440,70 @@ impl Node {
                     p2p.sync_manager.sync_in_progress = false;
                 }
             }
-            
-           // 5. Запрос блоков у пира
-if let Some(p2p) = self.p2p.as_mut() {
-    let now = current_timestamp();
-    
-    // Запрашиваем блоки не чаще чем раз в 2 секунды
-    if now - last_sync_request_time >= 2 {
-        // Забираем данные из сессии ДО mutable borrow
-        let session_data = p2p.sync_manager.active_session.as_ref().map(|session| {
-            (session.peer_id, session.current_height, session.target_height, session.status.clone())
-        });
-        
-        if let Some((peer_id, current_height, target_height, status)) = session_data {
-            if status == SyncStatus::Requesting {
-                let from_height = current_height + 1;
-                let to_height = (from_height + SYNC_BATCH_SIZE - 1).min(target_height);
-                
-                if from_height <= to_height {
-                    // ✅ ПРАВИЛЬНЫЙ ВЫЗОВ - без передачи p2p
-                    match p2p.sync_manager.request_blocks_from_peer(&peer_id, from_height) {
-                        Ok(_) => {
-                            last_sync_request_time = now;
-                            if let Some(session) = p2p.sync_manager.active_session.as_mut() {
-                                session.status = SyncStatus::Receiving;
-                                session.last_activity = now;
+
+            // 5. Запрос блоков у пира
+            if let Some(p2p) = self.p2p.as_mut() {
+                let now = current_timestamp();
+
+                // Запрашиваем блоки не чаще чем раз в 2 секунды
+                if now - last_sync_request_time >= 2 {
+                    // Забираем данные из сессии ДО mutable borrow
+                    let session_data = p2p.sync_manager.active_session.as_ref().map(|session| {
+                        (
+                            session.peer_id,
+                            session.current_height,
+                            session.target_height,
+                            session.status.clone(),
+                        )
+                    });
+
+                    if let Some((peer_id, current_height, target_height, status)) = session_data {
+                        if status == SyncStatus::Requesting {
+                            let from_height = current_height + 1;
+                            let to_height = (from_height + SYNC_BATCH_SIZE - 1).min(target_height);
+
+                            if from_height <= to_height {
+                                // ✅ ПРАВИЛЬНЫЙ ВЫЗОВ - без передачи p2p
+                                match p2p
+                                    .sync_manager
+                                    .request_blocks_from_peer(&peer_id, from_height)
+                                {
+                                    Ok(_) => {
+                                        last_sync_request_time = now;
+                                        if let Some(session) =
+                                            p2p.sync_manager.active_session.as_mut()
+                                        {
+                                            session.status = SyncStatus::Receiving;
+                                            session.last_activity = now;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("⚠️ Failed to request blocks: {}", e);
+                                        p2p.sync_manager.active_session = None;
+                                        p2p.sync_manager.sync_in_progress = false;
+                                    }
+                                }
+                            } else {
+                                if let Some(session) = p2p.sync_manager.active_session.as_mut() {
+                                    session.status = SyncStatus::Completed;
+                                    p2p.sync_manager.sync_in_progress = false;
+                                    println!(
+                                        "✅ Sync completed at height {}",
+                                        session.current_height
+                                    );
+                                }
                             }
                         }
-                        Err(e) => {
-                            println!("⚠️ Failed to request blocks: {}", e);
-                            p2p.sync_manager.active_session = None;
-                            p2p.sync_manager.sync_in_progress = false;
-                        }
-                    }
-                } else {
-                    if let Some(session) = p2p.sync_manager.active_session.as_mut() {
-                        session.status = SyncStatus::Completed;
-                        p2p.sync_manager.sync_in_progress = false;
-                        println!("✅ Sync completed at height {}", session.current_height);
                     }
                 }
             }
-        }
-    }
-}
-            
+
             // 7. Майнинг (только когда синхронизированы)
             let is_syncing = self.p2p.as_ref().map(|p| p.is_syncing()).unwrap_or(true);
             if mining_enabled && !is_syncing && self.sync_progress() >= 0.99 {
                 self.mine_block();
             }
-            
+
             // 8. Статистика
             let now = current_timestamp();
             if now - last_stats_time >= STATS_UPDATE_INTERVAL_MS / 1000 {
@@ -5138,23 +5513,24 @@ if let Some(p2p) = self.p2p.as_mut() {
                 } else {
                     String::new()
                 };
-                
+
                 // ✅ Получаем количество пиров через Option
                 let peer_count = self.p2p.as_ref().map(|p| p.peer_count()).unwrap_or(0);
-                print!("\r📊 Height: {} | Epoch: {} | Peers: {} | Shares: {}{}",
-                       self.height, self.epoch, peer_count, 
-                       self.shares_found, sync_status);
+                print!(
+                    "\r📊 Height: {} | Epoch: {} | Peers: {} | Shares: {}{}",
+                    self.height, self.epoch, peer_count, self.shares_found, sync_status
+                );
                 let _ = std::io::stdout().flush();
-                
+
                 last_stats_time = now;
             }
-            
+
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        
+
         Ok(())
     }
-    
+
     fn mine_block(&mut self) {
         // Проверяем время с последнего блока
         if let Some(last) = self.last_block() {
@@ -5163,36 +5539,9 @@ if let Some(p2p) = self.p2p.as_mut() {
                 return;
             }
         }
-        
-        // Получаем PoCI результаты (может быть пусто на генезисе)
-        let poci_results = calculate_poci(
-            &self.miners,
-            &self.bonds,
-            &self.loyalty,
-            self.height,
-        );
-        
-        // ✅ УБИРАЕМ БЛОКИРОВКУ! Майнинг работает даже без PoCI
-        // if poci_results.is_empty() {
-        //     return;
-        // }
-        
+
         let mut outputs = Vec::new();
         
-        // Добавляем PoCI награды (если есть)
-        for result in &poci_results {
-            if result.reward > 0 {
-                if let Some(wallet) = &self.wallet {
-                    if let Ok(txout) = TxOut::create_p2pkh(&wallet.address) {
-                        let mut txout = txout;
-                        txout.value = result.reward;
-                        outputs.push(txout);
-                    }
-                }
-            }
-        }
-        
-        // ✅ ВСЕГДА добавляем базовое вознаграждение за блок
         let block_reward = BLOCK_REWARD_LYT;
         if let Some(wallet) = &self.wallet {
             if let Ok(mut txout) = TxOut::create_p2pkh(&wallet.address) {
@@ -5201,29 +5550,15 @@ if let Some(p2p) = self.p2p.as_mut() {
             }
         }
         
-        // ✅ Если все еще нет outputs - создаем минимальный для теста
         if outputs.is_empty() {
-            if let Some(wallet) = &self.wallet {
-                if let Ok(mut txout) = TxOut::create_p2pkh(&wallet.address) {
-                    txout.value = 1;
-                    outputs.push(txout);
-                }
-            }
+            println!("⚠️ Unable to create block reward output");
+            return;
         }
-        
-        // ✅ Если все еще нет outputs - создаем фиктивный (крайний случай)
-        if outputs.is_empty() {
-            let txout = TxOut {
-                value: 1,
-                script_pubkey: vec![0x00; 20],
-            };
-            outputs.push(txout);
-        }
-        
+
         let coinbase = Transaction::coinbase(outputs, self.height + 1);
         let mut txs = vec![coinbase];
         let mut total_size = txs[0].serialize().len();
-        
+
         for tx in &self.mempool {
             if total_size + tx.serialize().len() > 1_000_000 {
                 break;
@@ -5231,15 +5566,13 @@ if let Some(p2p) = self.p2p.as_mut() {
             txs.push(tx.clone());
             total_size += tx.serialize().len();
         }
-        
+
         let prev_hash = self.last_hash();
         let difficulty = self.last_difficulty();
-        let mut header = BlockHeader::new(prev_hash, self.epoch + 1, difficulty);
-        
-        let mut hashes: Vec<Hash32> = txs.iter()
-            .map(|tx| tx.txid(&mut self.argon2))
-            .collect();
-        
+        let mut header = BlockHeader::new(prev_hash, self.epoch, difficulty);
+
+        let mut hashes: Vec<Hash32> = txs.iter().map(|tx| tx.txid(&mut self.argon2)).collect();
+
         while hashes.len() > 1 {
             let mut next = Vec::new();
             for chunk in hashes.chunks(2) {
@@ -5257,33 +5590,46 @@ if let Some(p2p) = self.p2p.as_mut() {
             }
             hashes = next;
         }
-        
-        header.merkle_root = if hashes.is_empty() { [0; 32] } else { hashes[0] };
-        
+
+        header.merkle_root = if hashes.is_empty() {
+            [0; 32]
+        } else {
+            hashes[0]
+        };
+
         let target_share = difficulty.share_target();
         let target_prefilter = difficulty.prefilter_target();
         let mut best_nonce = 0u64;
         let mut best_hash = [0xff; 32];
         let mut found_block = false;
-        
+
         // ✅ ОТЛАДКА
-        println!("⛏️  Mining block #{} with difficulty: {:.2}", 
-                 self.height + 1, difficulty.to_difficulty());
+        println!(
+            "⛏️  Mining block #{} with difficulty: {:.2}",
+            self.height + 1,
+            difficulty.to_difficulty()
+        );
         println!("   🔍 Prefilter DISABLED - testing all nonces");
-        println!("   📊 Target[0] = {:02x}, Target[1] = {:02x}", 
-                 difficulty.0[0], difficulty.0[1]);
-        
+        println!(
+            "   📊 Target[0] = {:02x}, Target[1] = {:02x}",
+            difficulty.0[0], difficulty.0[1]
+        );
+
         // Тестируем первые 10 nonce вручную
         for test_nonce in 0..10 {
             let test_hash = header.hash_with_nonce(test_nonce, &mut self.argon2);
             let meets = difficulty.is_met_by(&test_hash);
-            println!("   Nonce {}: hash[0]={:02x} {}", 
-                     test_nonce, test_hash[0], if meets { "✅ MEETS!" } else { "" });
+            println!(
+                "   Nonce {}: hash[0]={:02x} {}",
+                test_nonce,
+                test_hash[0],
+                if meets { "✅ MEETS!" } else { "" }
+            );
         }
-        
+
         let start_time = std::time::Instant::now();
         let mut last_progress = 0;
-        
+
         for nonce in 0..MINING_BATCH_SIZE {
             // ✅ Показываем прогресс каждые 100к nonce
             if nonce % 100_000 == 0 && nonce > 0 {
@@ -5291,21 +5637,24 @@ if let Some(p2p) = self.p2p.as_mut() {
                 let rate = nonce as f64 / elapsed;
                 if nonce / 100_000 > last_progress {
                     last_progress = nonce / 100_000;
-                    print!("\r   Nonce: {}/{} ({:.1}%) [{:.0} h/s]", 
-                           nonce, MINING_BATCH_SIZE,
-                           (nonce as f64 / MINING_BATCH_SIZE as f64) * 100.0,
-                           rate);
+                    print!(
+                        "\r   Nonce: {}/{} ({:.1}%) [{:.0} h/s]",
+                        nonce,
+                        MINING_BATCH_SIZE,
+                        (nonce as f64 / MINING_BATCH_SIZE as f64) * 100.0,
+                        rate
+                    );
                     let _ = std::io::stdout().flush();
                 }
             }
-            
+
             // ✅ Prefilter проверка - ВКЛЮЧЕНА!
             if !Argon2Cache::prefilter(&header.to_bytes(), nonce, &target_prefilter) {
                 continue;
             }
-            
+
             let hash = header.hash_with_nonce(nonce, &mut self.argon2);
-            
+
             // Проверка на блок
             if difficulty.is_met_by(&hash) {
                 header.nonce = nonce;
@@ -5315,25 +5664,28 @@ if let Some(p2p) = self.p2p.as_mut() {
                 println!("\n✅ BLOCK FOUND! Nonce: {}", nonce);
                 break;
             }
-            
+
             // Сохраняем лучший share
             if target_share.is_met_by(&hash) && hash < best_hash {
                 best_hash = hash;
                 best_nonce = nonce;
             }
         }
-        
+
         let elapsed = start_time.elapsed();
         if !found_block {
             println!("\n   Mining time: {:.2}s", elapsed.as_secs_f64());
-            println!("   Best nonce: {}, best hash: {}...", 
-                     best_nonce, hex::encode(&best_hash[0..8]));
+            println!(
+                "   Best nonce: {}, best hash: {}...",
+                best_nonce,
+                hex::encode(&best_hash[0..8])
+            );
         }
-        
+
         if found_block {
             // Нашли блок!
             header.nonce = best_nonce;
-            
+
             // ✅ ПРОВЕРЯЕМ ДУБЛИКАТЫ ТРАНЗАКЦИЙ В БЛОКЕ
             let mut block_txids = HashSet::new();
             for tx in &txs {
@@ -5347,32 +5699,41 @@ if let Some(p2p) = self.p2p.as_mut() {
                 }
                 block_txids.insert(txid);
             }
-            
+
             let (signature, pubkey) = if let Some(wallet) = &self.wallet {
                 let block_hash = header.hash(&mut self.argon2);
-                (wallet.sign_block(&block_hash).ok(), Some(wallet.public_key.clone()))
+                (
+                    wallet.sign_block(&block_hash).ok(),
+                    Some(wallet.public_key.clone()),
+                )
             } else {
                 (None, None)
             };
-            
+
             let block = Block {
                 header: header.clone(),
                 transactions: txs,
                 signature,
                 pubkey,
             };
-            
+
+            let share = Share::new(self.miner_id, header.clone(), best_nonce, best_hash);
+            if self.add_share(share) {
+                println!("📤 Share from block saved");
+            }
+
+            // 2. Потом обновляем состояние
             let new_height = self.height + 1;
             let _ = self.storage.save_block(new_height, &block);
-            
+
             self.blocks.push(header.clone());
             self.block_hashes.insert(best_hash, new_height);
             self.timestamps.push(header.timestamp);
             self.height = new_height;
             self.blocks_found += 1;
-            
+
             self.update_utxo_set(&block);
-            
+
             // ✅ ПОСЛЕ СОХРАНЕНИЯ БЛОКА - добавляем txid в processed
             for tx in &block.transactions {
                 if !tx.is_coinbase() {
@@ -5380,36 +5741,41 @@ if let Some(p2p) = self.p2p.as_mut() {
                     self.processed_txids.insert(txid);
                 }
             }
-            
+
             self.mempool.clear();
             let _ = self.storage.save_mempool(&self.mempool);
-            
+
             if new_height % EPOCH_BLOCKS == 0 {
                 self.process_epoch_end();
             }
-            
+
             let _ = self.storage.save_state("height", &self.height);
             let _ = self.storage.save_state("epoch", &self.epoch);
-            
+
             if self.height % self.config.advanced.checkpoint_interval == 0 {
                 self.create_checkpoint();
             }
-            
-            let _ = self.storage.maybe_backup(self.height, self.config.advanced.backup_interval_blocks);
-            
-            println!("\n⛏️  BLOCK MINED! Height: {}, Hash: {}...", 
-                     new_height, hex::encode(&best_hash[0..8]));
-            
-            
-                     if let Some(p2p) = &mut self.p2p {
-                        p2p.broadcast(&P2PMessage::Block {
-                            header: header.clone(),
-                            transactions: block.transactions,
-                        });
-                    }
-            
+
+            let _ = self
+                .storage
+                .maybe_backup(self.height, self.config.advanced.backup_interval_blocks);
+
+            // share уже сохранён выше (до обновления height)
+
+            println!(
+                "\n⛏️  BLOCK MINED! Height: {}, Hash: {}...",
+                new_height,
+                hex::encode(&best_hash[0..8])
+            );
+
+            if let Some(p2p) = &mut self.p2p {
+                p2p.broadcast(&P2PMessage::Block {
+                    header: header.clone(),
+                    transactions: block.transactions,
+                });
+            }
         } else if best_hash != [0xff; 32] {
-            // Сохраняем share
+            // Сохраняем share (когда блок не найден)
             let share = Share::new(self.miner_id, header, best_nonce, best_hash);
             if self.add_share(share) {
                 println!("📤 Share saved: {}...", hex::encode(&best_hash[0..8]));
@@ -5418,7 +5784,7 @@ if let Some(p2p) = self.p2p.as_mut() {
             println!("⚠️ No valid share found in this batch");
         }
     }
-    
+
     fn update_utxo_set(&mut self, block: &Block) {
         for tx in &block.transactions {
             for (i, output) in tx.outputs.iter().enumerate() {
@@ -5426,7 +5792,7 @@ if let Some(p2p) = self.p2p.as_mut() {
                 let outpoint = (txid, i as u32);
                 let _ = self.storage.save_utxo(&outpoint, output);
             }
-            
+
             for input in &tx.inputs {
                 if !input.is_coinbase() {
                     let _ = self.storage.delete_utxo(&input.outpoint());
@@ -5434,56 +5800,201 @@ if let Some(p2p) = self.p2p.as_mut() {
             }
         }
     }
-    
+
     fn process_epoch_end(&mut self) {
         println!("\n📅 Processing epoch {} end...", self.epoch);
-        
-        let poci_results = calculate_poci(
-            &self.miners,
-            &self.bonds,
-            &self.loyalty,
-            self.height,
-        );
-        
+
+        // Сохраняем номер завершённой эпохи
+        let completed_epoch = self.epoch;
+
+        // Рассчитываем PoCI и награды
+        let poci_results = calculate_poci(&self.miners, &self.bonds, &self.loyalty, self.height);
+
         let mut total_rewards = 0u64;
+        let mut rewarded_miners = 0u32;
+
         for result in &poci_results {
-            total_rewards += result.reward;
+            if result.reward == 0 {
+                continue;
+            }
+
+            total_rewards = total_rewards.saturating_add(result.reward);
+            rewarded_miners += 1;
+
+            // ✅ Генерируем детерминированный txid через SHA-256
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"ACCUM-EPOCH-REWARD");
+            hasher.update(&self.height.to_le_bytes());
+            hasher.update(&completed_epoch.to_le_bytes());
+            hasher.update(&result.miner_id);
+            let txid: [u8; 32] = hasher.finalize().into();
+
+            // Выплата награды
+            if result.miner_id == self.miner_id {
+                // Награда себе
+                if let Some(wallet) = &self.wallet {
+                    match TxOut::create_p2pkh(&wallet.address) {
+                        Ok(mut txout) => {
+                            txout.value = result.reward;
+                            let outpoint = (txid, 0u32);
+
+                            match self.storage.save_utxo(&outpoint, &txout) {
+                                Ok(_) => {
+                                    println!(
+                                        "   💰 Reward to self: {} LYT (shares={}, poci={:.4})",
+                                        result.reward, result.shares, result.poci
+                                    );
+                                }
+                                Err(e) => {
+                                    println!("   ❌ Failed to save reward UTXO: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("   ❌ Failed to create reward output: {}", e);
+                        }
+                    }
+                } else {
+                    println!(
+                        "   ⚠️ Local miner has no wallet; reward {} LYT was not created as UTXO",
+                        result.reward
+                    );
+                }
+            } else {
+                // Награда другому майнеру
+                if let Some(miner) = self.miners.get(&result.miner_id) {
+                    if let Some(ref payout_addr) = miner.payout_address {
+                        match TxOut::create_p2pkh(payout_addr) {
+                            Ok(mut txout) => {
+                                txout.value = result.reward;
+                                let outpoint = (txid, 0u32);
+
+                                match self.storage.save_utxo(&outpoint, &txout) {
+                                    Ok(_) => {
+                                        println!(
+                                            "   💰 Reward to {}...: {} LYT",
+                                            hex::encode(&result.miner_id[0..6]),
+                                            result.reward
+                                        );
+                                    }
+                                    Err(e) => {
+                                        println!("   ❌ Failed to save reward UTXO: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("   ❌ Failed to create reward output: {}", e);
+                            }
+                        }
+                    } else {
+                        println!(
+                            "   ⚠️ Miner {}... has no payout address, reward {} LYT lost",
+                            hex::encode(&result.miner_id[0..6]),
+                            result.reward
+                        );
+                    }
+                } else {
+                    println!(
+                        "   ⚠️ Miner {}... not found in local state",
+                        hex::encode(&result.miner_id[0..6])
+                    );
+                }
+            }
+
+            // Обновляем статистику майнера
+            if let Some(miner) = self.miners.get_mut(&result.miner_id) {
+                miner.total_rewards = miner.total_rewards.saturating_add(result.reward);
+
+                if let Err(e) = self.storage.save_miner(&result.miner_id, miner) {
+                    println!(
+                        "   ⚠️ Failed to save miner {}: {}",
+                        hex::encode(&result.miner_id[0..6]),
+                        e
+                    );
+                }
+            }
         }
-        
+
         println!("   Total epoch rewards: {} LYT", total_rewards);
-        println!("   Active miners: {}", poci_results.len());
-        
+        println!("   Rewarded miners: {}", rewarded_miners);
+
+        // ========================================
+        // ЗАВЕРШАЕМ ЭПОХУ
+        // ========================================
+
         self.share_pool.new_epoch();
-        self.epoch += 1;
-        
-        let current_epoch = self.epoch;
+
+        // ⚠️ ВАЖНО: увеличиваем эпоху ПОСЛЕ использования completed_epoch
+        self.epoch = self.epoch.saturating_add(1);
+
+        // ========================================
+        // ОБНОВЛЯЕМ LOYALTY
+        // ========================================
+
         let miners_to_update: Vec<MinerId> = self.miners.keys().copied().collect();
-        
+
         for miner_id in miners_to_update {
-            let loyalty = self.loyalty.entry(miner_id).or_insert_with(LoyaltyData::new);
-            loyalty.update(current_epoch, false);
-            
+            let participated = poci_results
+                .iter()
+                .any(|r| r.miner_id == miner_id && r.shares > 0);
+
+            let loyalty = self
+                .loyalty
+                .entry(miner_id)
+                .or_insert_with(LoyaltyData::new);
+
+            // ✅ Используем completed_epoch, а не новую эпоху
+            loyalty.update(completed_epoch, participated);
+
             let key = format!("loyalty_{}", hex::encode(&miner_id));
-            let _ = self.storage.save_state(&key, loyalty);
+
+            if let Err(e) = self.storage.save_state(&key, loyalty) {
+                println!(
+                    "   ⚠️ Failed to save loyalty for {}: {}",
+                    hex::encode(&miner_id[0..6]),
+                    e
+                );
+            }
         }
-        
+
+        // ========================================
+        // ОБНУЛЯЕМ SHARES
+        // ========================================
+
         for miner in self.miners.values_mut() {
             miner.shares = 0;
-            let _ = self.storage.save_miner(&miner.miner_id, miner);
+
+            if let Err(e) = self.storage.save_miner(&miner.miner_id, miner) {
+                println!(
+                    "   ⚠️ Failed to reset shares for {}: {}",
+                    hex::encode(&miner.miner_id[0..6]),
+                    e
+                );
+            }
         }
-        
-        println!("✅ Epoch {} started", self.epoch);
+
+        // ========================================
+        // СОХРАНЯЕМ НОВУЮ ЭПОХУ
+        // ========================================
+
+        if let Err(e) = self.storage.save_state("epoch", &self.epoch) {
+            println!("   ⚠️ Failed to save epoch: {}", e);
+        }
+
+        println!("✅ Epoch {} completed", completed_epoch);
+        println!("🚀 Epoch {} started", self.epoch);
     }
-    
+
     fn create_checkpoint(&mut self) {
         let last_block = match self.last_block() {
             Some(block) => block.clone(),
             None => return,
         };
-        
+
         let block_hash = last_block.hash(&mut self.argon2);
         let state_root = self.calculate_state_root();
-        
+
         let (signature, _pubkey) = if let Some(wallet) = &self.wallet {
             let message = {
                 let mut data = Vec::new();
@@ -5492,11 +6003,14 @@ if let Some(p2p) = self.p2p.as_mut() {
                 data.extend_from_slice(&state_root);
                 Sha256::digest(&data)
             };
-            (wallet.sign(&message.into()).ok(), Some(wallet.public_key.clone()))
+            (
+                wallet.sign(&message.into()).ok(),
+                Some(wallet.public_key.clone()),
+            )
         } else {
             (None, None)
         };
-        
+
         let checkpoint = Checkpoint {
             height: self.height,
             block_hash,
@@ -5505,48 +6019,48 @@ if let Some(p2p) = self.p2p.as_mut() {
             signature: signature.unwrap_or_default(),
             verified: false,
         };
-        
+
         self.checkpoints.push(checkpoint.clone());
         let _ = self.storage.save_checkpoint(self.height, &checkpoint);
-        
+
         if self.checkpoints.len() > self.config.advanced.max_checkpoints {
             self.checkpoints.remove(0);
         }
-        
+
         println!("📌 Checkpoint created at height {}", self.height);
     }
-    
+
     fn calculate_state_root(&self) -> Hash32 {
         let mut data = Vec::new();
-        
+
         for (id, miner) in &self.miners {
             data.extend_from_slice(id);
             data.extend_from_slice(&miner.shares.to_le_bytes());
             data.extend_from_slice(&miner.bond.to_le_bytes());
         }
-        
+
         for (id, bond) in &self.bonds {
             data.extend_from_slice(id);
             data.extend_from_slice(&bond.amount.to_le_bytes());
             data.extend_from_slice(&bond.lock_until.to_le_bytes());
         }
-        
+
         let hash = Sha256::digest(&data);
         let mut result = [0u8; 32];
         result.copy_from_slice(&hash);
         result
-    }   
-} 
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    
+
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║    ACCUM v3.2+ - Fair Proof-of-Contribution Blockchain       ║");
     println!("║         WORKING NODE WITH SOLO MINING + SLASHING             ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
-    
+
     match args.get(1).map(|s| s.as_str()) {
         Some("wallet") => {
             handle_wallet_command(&args)?;
@@ -5569,7 +6083,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_node().await?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -5601,7 +6115,10 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             println!("\n⚠️  SAVE YOUR PRIVATE KEY SECURELY:");
             println!("📜 Private Key: {}", hex::encode(&wallet.secret_key));
             println!("\n💡 To use this wallet, save the private key and run:");
-            println!("   echo '{}' > ~/.accum/wallet.key", hex::encode(&wallet.secret_key));
+            println!(
+                "   echo '{}' > ~/.accum/wallet.key",
+                hex::encode(&wallet.secret_key)
+            );
         }
         Some("show") => {
             // ПОКАЗАТЬ ПРИВАТНЫЙ КЛЮЧ
@@ -5609,22 +6126,22 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                 .ok_or("Cannot find home dir")?
                 .join(".accum")
                 .join("wallet.json");
-            
+
             if !wallet_path.exists() {
                 println!("❌ Wallet file not found at: {}", wallet_path.display());
                 println!("   Create a wallet first with: accum wallet create");
                 return Ok(());
             }
-            
+
             let content = std::fs::read_to_string(&wallet_path)?;
-            
+
             #[derive(serde::Deserialize)]
             struct WalletFile {
                 private_key: String,
             }
-            
+
             let wallet_data: WalletFile = serde_json::from_str(&content)?;
-            
+
             println!("\n🔐 WARNING: PRIVATE KEY EXPOSURE!");
             println!("═══════════════════════════════════════════");
             println!("⚠️  Anyone with this key can STEAL your funds!");
@@ -5644,23 +6161,26 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                 .ok_or("Cannot find home dir")?
                 .join(".accum")
                 .join("wallet.json");
-            
+
             if !wallet_path.exists() {
                 println!("❌ Wallet file not found at: {}", wallet_path.display());
                 println!("   Create a wallet first with: accum wallet create");
                 return Ok(());
             }
-            
+
             let backup_path = dirs::home_dir()
                 .ok_or("Cannot find home dir")?
                 .join(".accum")
-                .join(format!("wallet_backup_{}.json", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()));
-            
+                .join(format!(
+                    "wallet_backup_{}.json",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                ));
+
             std::fs::copy(&wallet_path, &backup_path)?;
-            
+
             println!("\n✅ Wallet exported successfully!");
             println!("📁 Backup saved to: {}", backup_path.display());
             println!("\n💡 To restore, copy this file to:");
@@ -5671,9 +6191,9 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         }
         Some("balance") => {
             let address = args.get(3).ok_or("Address required")?;
-            
+
             println!("📊 Checking balance for {}...", address);
-            
+
             // Пробуем открыть локальную базу mainnet
             let storage = match ProductionStorage::new("mainnet") {
                 Ok(s) => s,
@@ -5683,7 +6203,7 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                     return Ok(());
                 }
             };
-        
+
             match storage.get_balance_by_address(address) {
                 Ok((balance_lyt, utxo_count)) => {
                     let acm = balance_lyt as f64 / LYATORS_PER_ACM as f64;
@@ -5701,18 +6221,18 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             let to = args.get(3).ok_or("Recipient address required")?;
             let amount_str = args.get(4).ok_or("Amount required")?;
             let amount: u64 = amount_str.parse().map_err(|_| "Invalid amount")?;
-        
+
             // 1. Загружаем кошелёк
             let wallet_path = dirs::home_dir()
                 .ok_or("Cannot find home dir")?
                 .join(".accum")
                 .join("wallet.json");
-        
+
             if !wallet_path.exists() {
                 println!("❌ Wallet not found. Create one first: accum wallet create");
                 return Ok(());
             }
-        
+
             let content = std::fs::read_to_string(&wallet_path)?;
             #[derive(serde::Deserialize)]
             struct WalletFile {
@@ -5722,22 +6242,22 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             let secret_bytes = hex::decode(&wallet_data.private_key)
                 .map_err(|e| format!("Invalid private key hex: {}", e))?;
             let wallet = Wallet::from_secret_key(&secret_bytes)?;
-        
+
             println!("💳 From:   {}", wallet.address);
             println!("📤 To:     {}", to);
             println!("💰 Amount: {} LYT", amount);
-        
+
             // 2. Открываем базу и получаем UTXO
             let storage = ProductionStorage::new("mainnet")?;
             let utxos = storage.get_utxos_by_address(&wallet.address)?;
-        
+
             if utxos.is_empty() {
                 println!("❌ No UTXOs found for this address");
                 return Ok(());
             }
-        
+
             println!("📦 Found {} UTXO(s)", utxos.len());
-        
+
             // 3. Создаём и подписываем транзакцию
             let fee = 1000u64;
             let tx = match wallet.create_simple_tx(&utxos, to, amount, fee) {
@@ -5747,20 +6267,23 @@ fn handle_wallet_command(args: &[String]) -> Result<(), Box<dyn std::error::Erro
                     return Ok(());
                 }
             };
-        
+
             let tx_bytes = bincode::serialize(&tx).map_err(|e| e.to_string())?;
             let tx_hex = hex::encode(&tx_bytes);
-        
+
             println!("\n✅ Transaction created and signed");
             println!("   Fee: {} LYT", fee);
             println!("   Size: {} bytes", tx_bytes.len());
-        
+
             // 4. Пытаемся отправить через RPC
-            println!("\n📡 Trying to broadcast via RPC (localhost:{})...", RPC_PORT);
-        
+            println!(
+                "\n📡 Trying to broadcast via RPC (localhost:{})...",
+                RPC_PORT
+            );
+
             let client = reqwest::blocking::Client::new();
             let url = format!("http://127.0.0.1:{}/transaction", RPC_PORT);
-        
+
             match client
                 .post(&url)
                 .header("Content-Type", "text/plain")
@@ -5862,9 +6385,9 @@ fn handle_info_command() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_node() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     println!("📋 Loaded configuration from ~/.accum/config.toml");
-    
+
     let node_arc = Node::new(config.clone())?;
-    
+
     // RPC сервер
     if config.rpc.enabled {
         let rpc_node = node_arc.clone();
@@ -5876,7 +6399,7 @@ async fn run_node() -> Result<(), Box<dyn std::error::Error>> {
         });
         println!("📡 RPC server started on port {}", config.rpc.port);
     }
-    
+
     // Добавляем bond если майнинг включен
     {
         let mut node = node_arc.write();
@@ -5886,7 +6409,7 @@ async fn run_node() -> Result<(), Box<dyn std::error::Error>> {
             println!("💰 Bond added: {} LYT", config.mining.bond);
         }
     }
-    
+
     // Graceful shutdown handler
     let node_clone = node_arc.clone();
     tokio::spawn(async move {
@@ -5894,7 +6417,7 @@ async fn run_node() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n\n⚠️  Received Ctrl+C");
         println!("⏳ Shutting down, please wait...");
         SHUTDOWN.store(true, AtomicOrdering::SeqCst);
-        
+
         // Сохраняем состояние
         {
             let node = node_clone.write();
@@ -5903,29 +6426,38 @@ async fn run_node() -> Result<(), Box<dyn std::error::Error>> {
             let _ = node.storage.flush();
             println!("✅ State saved");
         }
-        
+
         tokio::time::sleep(Duration::from_secs(2)).await;
         println!("👋 Goodbye!");
         std::process::exit(0);
     });
-    
+
     println!("\n=== NODE STARTED ===");
     {
         let node = node_arc.read();
         println!("🔗 Height: {}", node.height);
         println!("📅 Epoch: {}", node.epoch);
         println!("👤 Miner ID: {}...", hex::encode(&node.miner_id[0..8]));
-        println!("💳 Address: {}", node.wallet.as_ref().map(|w| w.address.clone()).unwrap_or_default());
+        println!(
+            "💳 Address: {}",
+            node.wallet
+                .as_ref()
+                .map(|w| w.address.clone())
+                .unwrap_or_default()
+        );
         if config.mining.enabled {
-            println!("⛏️  Solo mining ENABLED with {} threads", config.mining.threads);
+            println!(
+                "⛏️  Solo mining ENABLED with {} threads",
+                config.mining.threads
+            );
         } else {
             println!("⛏️  Solo mining DISABLED");
         }
     }
     println!("========================\n");
-    
+
     let mut node = node_arc.write();
     node.run_with_graceful_shutdown()?;
-    
+
     Ok(())
-} 
+}
